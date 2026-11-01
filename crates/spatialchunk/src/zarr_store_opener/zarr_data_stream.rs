@@ -521,6 +521,7 @@ impl Stream for ZarrRecordBatchStream {
 mod zarr_stream_tests {
     use std::collections::HashMap;
 
+    use arrow::array::AsArray;
     use arrow::compute::concat_batches;
     use datafusion::config::ConfigOptions;
     use datafusion::logical_expr::{Operator, ScalarUDF};
@@ -528,13 +529,15 @@ mod zarr_stream_tests {
     use datafusion::physical_expr::ScalarFunctionExpr;
     use datafusion::physical_plan::expressions::binary;
     use futures_util::TryStreamExt;
+    use serde_json::json;
 
     use super::*;
     use crate::geospatial::geos::indexed_build_side::test_helpers::make_indexed_build_side;
     use crate::geospatial::udfs::st_point::StPointUdf;
     use crate::test_utils::{
         extract_col, get_local_zarr_store, get_local_zarr_store_3d, get_local_zarr_store_4d,
-        get_local_zarr_store_mix_dims, get_local_zarr_store_no_coords, validate_names_and_types,
+        get_local_zarr_store_cf_times, get_local_zarr_store_mix_dims,
+        get_local_zarr_store_no_coords, get_local_zarr_store_with_attrs, validate_names_and_types,
         validate_primitive_column,
     };
     // a chunk filter for "lat < 41 AND lon > -118".
@@ -715,6 +718,143 @@ mod zarr_stream_tests {
             &batch,
             &[100., 101., 102., 103., 104., 105., 106., 107.],
         );
+    }
+
+    #[tokio::test]
+    async fn read_scaled_data_test() {
+        let data1_attrs = json!({ "scale_factor": 2, "add_offset": 1 });
+        let data2_attrs = json!({ "scale_factor": 3.0, "add_offset": 4.0 });
+        let (wrapper, _) = get_local_zarr_store_with_attrs(
+            data1_attrs.as_object().cloned(),
+            data2_attrs.as_object().cloned(),
+            "scaled_data",
+        )
+        .await;
+        let store = wrapper.get_store();
+
+        // unpacking makes both columns floats, including the int data.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("data1", DataType::Float64, true),
+            Field::new("data2", DataType::Float64, true),
+        ]));
+        let stream =
+            ZarrRecordBatchStreamBuilder::new_from_store(store, schema.clone(), None, None, 1, 0)
+                .build()
+                .await
+                .unwrap();
+        let records: Vec<_> = stream.try_collect().await.unwrap();
+
+        let target_types = HashMap::from([
+            ("data1".to_string(), DataType::Float64),
+            ("data2".to_string(), DataType::Float64),
+        ]);
+        validate_names_and_types(&target_types, &records[0]);
+        assert_eq!(records.len(), 3);
+
+        let batch = concat_batches(&schema, &records).unwrap();
+        validate_primitive_column::<Float64Type, f64>("data1", &batch, &[3., 5., 7., 9., 11.]);
+        validate_primitive_column::<Float64Type, f64>(
+            "data2",
+            &batch,
+            &[34., 64., 94., 124., 154.],
+        );
+    }
+
+    #[tokio::test]
+    async fn read_masked_data_test() {
+        // the valid range is in packed units, so it's applied before the
+        // scale. scaling first would put every value outside of the range.
+        let data1_attrs = json!({ "valid_range": [2, 4], "scale_factor": 10 });
+        let data2_attrs = json!({ "_FillValue": 20.0, "missing_value": 40.0 });
+        let (wrapper, _) = get_local_zarr_store_with_attrs(
+            data1_attrs.as_object().cloned(),
+            data2_attrs.as_object().cloned(),
+            "masked_data",
+        )
+        .await;
+        let store = wrapper.get_store();
+
+        // the scale makes the int data floats.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("data1", DataType::Float64, true),
+            Field::new("data2", DataType::Float64, true),
+        ]));
+        let stream =
+            ZarrRecordBatchStreamBuilder::new_from_store(store, schema.clone(), None, None, 1, 0)
+                .build()
+                .await
+                .unwrap();
+        let records: Vec<_> = stream.try_collect().await.unwrap();
+        assert_eq!(records.len(), 3);
+
+        let batch = concat_batches(&schema, &records).unwrap();
+        let values = |name: &str| -> Vec<Option<f64>> {
+            batch
+                .column_by_name(name)
+                .unwrap()
+                .as_primitive::<Float64Type>()
+                .iter()
+                .collect()
+        };
+        assert_eq!(
+            values("data1"),
+            vec![None, Some(20.), Some(30.), Some(40.), None]
+        );
+        assert_eq!(
+            values("data2"),
+            vec![Some(10.), None, Some(30.), None, Some(50.)]
+        );
+    }
+
+    #[tokio::test]
+    async fn read_cf_times_test() {
+        let (wrapper, schema) = get_local_zarr_store_cf_times("cf_times_data").await;
+        let store = wrapper.get_store();
+
+        let stream =
+            ZarrRecordBatchStreamBuilder::new_from_store(store, schema.clone(), None, None, 1, 0)
+                .build()
+                .await
+                .unwrap();
+        let records: Vec<_> = stream.try_collect().await.unwrap();
+
+        let target_types = HashMap::from([
+            (
+                "duration".to_string(),
+                DataType::Duration(TimeUnit::Nanosecond),
+            ),
+            (
+                "time1".to_string(),
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+            ),
+            (
+                "time2".to_string(),
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+            ),
+        ]);
+        validate_names_and_types(&target_types, &records[0]);
+        assert_eq!(records.len(), 3);
+
+        // jan 1 of 2020 to 2024, in nanoseconds since the epoch.
+        let batch = concat_batches(&schema, &records).unwrap();
+        let times: Vec<i64> = [
+            1_577_836_800,
+            1_609_459_200,
+            1_640_995_200,
+            1_672_531_200,
+            1_704_067_200,
+        ]
+        .iter()
+        .map(|t| t * 1_000_000_000)
+        .collect();
+        validate_primitive_column::<TimestampNanosecondType, i64>("time1", &batch, &times);
+        validate_primitive_column::<TimestampNanosecondType, i64>("time2", &batch, &times);
+
+        let durations: Vec<i64> = [10, 100, 1_000, 10_000, 100_000]
+            .iter()
+            .map(|m| m * 60 * 1_000_000_000)
+            .collect();
+        validate_primitive_column::<DurationNanosecondType, i64>("duration", &batch, &durations);
     }
 
     #[tokio::test]

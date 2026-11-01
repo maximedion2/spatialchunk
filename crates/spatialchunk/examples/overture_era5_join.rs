@@ -58,11 +58,8 @@ async fn main() -> Result<()> {
     .await?;
 
     // the average 2m temperature in each county around the bay area, on
-    // 2024-01-01 at 10:00. a few notes on the era5 data:
-    //  - `valid_time` is stored as hours since 1940-01-01 (CF-encoded, not a
-    //    datetime type), 736354 is 2024-01-01T10:00:00.
-    //  - longitudes go from 0 to 360, they're shifted to -180 to 180 to match
-    //    the overture geometries.
+    // 2024-01-01 at 10:00. longitudes go from 0 to 360, they're shifted to
+    // -180 to 180 to match the overture geometries.
     let query = "
         WITH counties AS (
             SELECT names['primary'] AS name, st_geomfromwkb(geometry) AS geom
@@ -80,7 +77,7 @@ async fn main() -> Result<()> {
                 CASE WHEN longitude > 180 THEN longitude - 360 ELSE longitude END AS lon,
                 t2m AS temperature
             FROM era5
-            WHERE valid_time = 736354
+            WHERE valid_time = TIMESTAMP '2024-01-01T10:00:00'
         )
         SELECT c.name, avg(t.temperature) AS avg_temperature
         FROM counties c
