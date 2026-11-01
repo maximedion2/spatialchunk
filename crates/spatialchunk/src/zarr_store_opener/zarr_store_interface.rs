@@ -17,15 +17,19 @@ use std::sync::Arc;
 
 use arrow::array::*;
 use arrow::compute::kernels::aggregate::{max as arrow_max, min as arrow_min};
-use arrow::compute::{concat, take};
+use arrow::compute::kernels::cmp::{eq, gt, lt};
+use arrow::compute::{cast, cast_with_options, concat, nullif, or, take, CastOptions};
 use arrow::datatypes::*;
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
+use base64::prelude::{Engine, BASE64_STANDARD};
 use bytes::Bytes;
+use chrono::{NaiveDate, NaiveDateTime, TimeDelta};
 use datafusion::common::ScalarValue;
 use datafusion::logical_expr::ColumnarValue;
 use datafusion::physical_expr::utils::{collect_columns, reassign_expr_columns};
 use datafusion::physical_plan::PhysicalExpr;
 use futures::future::{BoxFuture, Shared};
+use serde_json::{Map, Value};
 use tokio::sync::mpsc::Receiver;
 use tokio::task::JoinSet;
 use zarrs::array::codec::api::{ArrayToBytesCodecTraits, CodecOptions};
@@ -333,11 +337,739 @@ fn coords_only_meta(
 }
 
 //***************************************************
+// The time conversions that can be expressed with CF attributes,
+// for int and float arrays. the output is always in nanoseconds.
+//***************************************************
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CfTimeUnit {
+    Days,
+    Hours,
+    Minutes,
+    Seconds,
+    Milliseconds,
+    Microseconds,
+    Nanoseconds,
+}
+
+impl CfTimeUnit {
+    // the lower case names, singular or plural, the same list xarray supports.
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "days" | "day" => Some(Self::Days),
+            "hours" | "hour" => Some(Self::Hours),
+            "minutes" | "minute" => Some(Self::Minutes),
+            "seconds" | "second" => Some(Self::Seconds),
+            "milliseconds" | "millisecond" => Some(Self::Milliseconds),
+            "microseconds" | "microsecond" => Some(Self::Microseconds),
+            "nanoseconds" | "nanosecond" => Some(Self::Nanoseconds),
+            _ => None,
+        }
+    }
+
+    fn nanos(&self) -> i64 {
+        match self {
+            Self::Days => 86_400_000_000_000,
+            Self::Hours => 3_600_000_000_000,
+            Self::Minutes => 60_000_000_000,
+            Self::Seconds => 1_000_000_000,
+            Self::Milliseconds => 1_000_000,
+            Self::Microseconds => 1_000,
+            Self::Nanoseconds => 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CfCalendar {
+    Standard,
+    ProlepticGregorian,
+}
+
+impl CfCalendar {
+    // a missing calendar means the standard one. the other calendars have
+    // dates that arrow timestamps can't represent (e.g. feb 30 in 360_day).
+    fn from_name(name: Option<&str>) -> ZarrQueryResult<Self> {
+        match name.map(|n| n.trim().to_lowercase()).as_deref() {
+            None | Some("standard") | Some("gregorian") => Ok(Self::Standard),
+            Some("proleptic_gregorian") => Ok(Self::ProlepticGregorian),
+            Some(other) => Err(ZarrQueryError::InvalidMetadata(format!(
+                "Unsupported calendar {other}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum TimeConversion {
+    // e.g. units "hours", with a "timedelta64" dtype attribute.
+    Duration {
+        unit: CfTimeUnit,
+    },
+    // e.g. units "days since 1970-01-01", the reference is in nanoseconds
+    // since the unix epoch.
+    TimeSince {
+        unit: CfTimeUnit,
+        reference_ns: i64,
+        calendar: CfCalendar,
+    },
+}
+
+impl TimeConversion {
+    // the caller decides if the array is a duration, xarray only decodes
+    // durations when the dtype attribute marks them, so units like "hours"
+    // alone are left as raw values.
+    fn duration(units: &str) -> ZarrQueryResult<Self> {
+        let unit = CfTimeUnit::from_name(units.trim()).ok_or_else(|| {
+            ZarrQueryError::InvalidMetadata(format!("Unsupported duration units {units}"))
+        })?;
+        Ok(Self::Duration { unit })
+    }
+
+    fn time_since(units: &str, calendar: Option<&str>) -> ZarrQueryResult<Self> {
+        let lower = units.trim().to_lowercase();
+        let (unit, reference) = lower.split_once(" since ").ok_or_else(|| {
+            ZarrQueryError::InvalidMetadata(format!(
+                "Expected <unit> since <datetime>, got {units}"
+            ))
+        })?;
+
+        let unit = CfTimeUnit::from_name(unit.trim()).ok_or_else(|| {
+            ZarrQueryError::InvalidMetadata(format!("Unsupported time units {units}"))
+        })?;
+
+        let calendar = CfCalendar::from_name(calendar)?;
+        let reference = parse_reference_datetime(reference.trim()).ok_or_else(|| {
+            ZarrQueryError::InvalidMetadata(format!("Unsupported reference datetime in {units}"))
+        })?;
+
+        // the outputs are nanosecond timestamps, so the reference has to fit
+        // in that range too. this also rules out dates before 1582, where the
+        // standard calendar would follow julian rules.
+        let reference_ns = reference.and_utc().timestamp_nanos_opt().ok_or_else(|| {
+            ZarrQueryError::InvalidMetadata(format!(
+                "Reference datetime in {units} is out of the nanosecond timestamp range"
+            ))
+        })?;
+
+        Ok(Self::TimeSince {
+            unit,
+            reference_ns,
+            calendar,
+        })
+    }
+
+    fn data_type(&self) -> DataType {
+        match self {
+            Self::Duration { .. } => DataType::Duration(TimeUnit::Nanosecond),
+            Self::TimeSince { .. } => DataType::Timestamp(TimeUnit::Nanosecond, None),
+        }
+    }
+
+    // converts int or float values to nanoseconds. integers are converted
+    // exactly, floats are rounded to the nearest nanosecond and NaN becomes
+    // null. values out of the nanosecond range are an error.
+    fn convert(&self, arr: ArrayRef) -> ZarrQueryResult<ArrayRef> {
+        let (unit, offset_ns) = match self {
+            Self::Duration { unit } => (unit, 0),
+            Self::TimeSince {
+                unit, reference_ns, ..
+            } => (unit, *reference_ns),
+        };
+        let nanos = unit.nanos();
+        let out_of_range = || {
+            ZarrQueryError::InvalidCompute(
+                "Time value is out of the nanosecond timestamp range".into(),
+            )
+        };
+
+        let values: Vec<Option<i64>> = if arr.data_type().is_floating() {
+            let floats = cast(&arr, &DataType::Float64)?;
+            floats
+                .as_primitive::<Float64Type>()
+                .iter()
+                .map(|v| match v {
+                    Some(v) if !v.is_nan() => {
+                        let delta = (v * nanos as f64).round();
+                        // i64::MAX as f64 is 2^63, which doesn't fit, hence the <.
+                        if !(delta >= i64::MIN as f64 && delta < i64::MAX as f64) {
+                            return Err(out_of_range());
+                        }
+                        (delta as i64)
+                            .checked_add(offset_ns)
+                            .map(Some)
+                            .ok_or_else(out_of_range)
+                    }
+                    _ => Ok(None),
+                })
+                .collect::<ZarrQueryResult<_>>()?
+        } else {
+            // not a safe cast, so that u64 values past i64::MAX are an error
+            // rather than null.
+            let options = CastOptions {
+                safe: false,
+                ..Default::default()
+            };
+            let ints = cast_with_options(&arr, &DataType::Int64, &options)?;
+            ints.as_primitive::<Int64Type>()
+                .iter()
+                .map(|v| {
+                    v.map(|v| {
+                        v.checked_mul(nanos)
+                            .and_then(|v| v.checked_add(offset_ns))
+                            .ok_or_else(out_of_range)
+                    })
+                    .transpose()
+                })
+                .collect::<ZarrQueryResult<_>>()?
+        };
+
+        Ok(match self {
+            Self::Duration { .. } => Arc::new(DurationNanosecondArray::from(values)) as ArrayRef,
+            Self::TimeSince { .. } => Arc::new(TimestampNanosecondArray::from(values)),
+        })
+    }
+}
+
+// parses the udunits style reference datetime, in utc. the fields don't need
+// to be padded, the time and the offset are optional, e.g. "1-1-1",
+// "1970-01-01T00:00:00Z", "2000-1-1 12:30:00.5 +5:30". the input is lower case.
+fn parse_reference_datetime(s: &str) -> Option<NaiveDateTime> {
+    let (date, rest) = match s
+        .char_indices()
+        .find(|(_, c)| *c == 't' || c.is_whitespace())
+    {
+        Some((i, c)) => (&s[..i], s[i + c.len_utf8()..].trim_start()),
+        None => (s, ""),
+    };
+
+    let mut parts = date.split('-');
+    let year = parse_digits(parts.next()?)?;
+    let month = parse_digits(parts.next()?)?;
+    let day = parse_digits(parts.next()?)?;
+    if parts.next().is_some() {
+        return None;
+    }
+
+    // the time is everything up to the offset, if any.
+    let time_len = rest
+        .find(|c: char| !(c.is_ascii_digit() || c == ':' || c == '.'))
+        .unwrap_or(rest.len());
+    let (time, offset) = (&rest[..time_len], rest[time_len..].trim());
+    let (hour, min, sec, nanos) = match time.is_empty() {
+        true => (0, 0, 0, 0),
+        false => parse_time(time)?,
+    };
+
+    let local =
+        NaiveDate::from_ymd_opt(year, month, day)?.and_hms_nano_opt(hour, min, sec, nanos)?;
+    local.checked_sub_signed(TimeDelta::seconds(parse_offset_secs(offset)?))
+}
+
+// "h:m", "h:m:s" or "h:m:s.f", fractions past nanoseconds are truncated.
+fn parse_time(time: &str) -> Option<(u32, u32, u32, u32)> {
+    let mut parts = time.split(':');
+    let hour = parse_digits(parts.next()?)?;
+    let min = parse_digits(parts.next()?)?;
+    let (sec, nanos) = match parts.next() {
+        None => (0, 0),
+        Some(s) => {
+            let (whole, frac) = s.split_once('.').unwrap_or((s, ""));
+            let nanos = match frac.is_empty() {
+                true => 0,
+                false => {
+                    let frac: String = frac.chars().take(9).collect();
+                    parse_digits(&format!("{frac:0<9}"))?
+                }
+            };
+            (parse_digits(whole)?, nanos)
+        }
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((hour, min, sec, nanos))
+}
+
+// "", "z", "utc", or a signed offset like "+5", "-6:00", "+0530".
+fn parse_offset_secs(offset: &str) -> Option<i64> {
+    if matches!(offset, "" | "z" | "utc") {
+        return Some(0);
+    }
+    let (sign, rest) = match offset.as_bytes().first()? {
+        b'+' => (1, &offset[1..]),
+        b'-' => (-1, &offset[1..]),
+        _ => return None,
+    };
+    let (hours, mins): (i64, i64) = match rest.split_once(':') {
+        Some((h, m)) => (parse_digits(h)?, parse_digits(m)?),
+        None if rest.len() == 4 => (parse_digits(&rest[..2])?, parse_digits(&rest[2..])?),
+        None => (parse_digits(rest)?, 0),
+    };
+    if hours > 23 || mins > 59 {
+        return None;
+    }
+    Some(sign * (hours * 3600 + mins * 60))
+}
+
+// a non empty, unsigned run of digits.
+fn parse_digits<N: std::str::FromStr>(s: &str) -> Option<N> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse().ok()
+}
+
+//***************************************************
+// Sets the values that represent missing data to null, from the
+// _FillValue, missing_value and valid range attributes. the mask is
+// applied before unpacking (i.e. scale and offset).
+//***************************************************
+struct DataMask {
+    // _FillValue and missing_value. NaN is a separate flag since it never
+    // compares equal.
+    values: Option<Vec<Scalar<ArrayRef>>>,
+    nan_is_null: bool,
+
+    // valid_min and valid_max, or valid_range, the bounds are inclusive.
+    min: Option<Scalar<ArrayRef>>,
+    max: Option<Scalar<ArrayRef>>,
+}
+
+impl DataMask {
+    // None if none of the attributes are present.
+    fn new(
+        attrs: &Map<String, Value>,
+        raw_type: &DataType,
+        reinterpret_type: Option<&DataType>,
+    ) -> Result<Option<Self>, String> {
+        let mut fill_json = Vec::new();
+        if let Some(v) = attrs.get("_FillValue") {
+            fill_json.push(v);
+        }
+        match attrs.get("missing_value") {
+            Some(Value::Array(values)) => fill_json.extend(values),
+            Some(v) => fill_json.push(v),
+            None => {}
+        }
+        let (values, nan_is_null) = match fill_json.is_empty() {
+            true => (None, false),
+            false => {
+                let (values, nan) = parse_scalars(&fill_json, raw_type, reinterpret_type)?;
+                (Some(values).filter(|v| !v.is_empty()), nan)
+            }
+        };
+
+        // a bound is a single value, as a number or a single element list.
+        let bound = |key: &str| -> Result<Option<Scalar<ArrayRef>>, String> {
+            let value = match attrs.get(key) {
+                None => return Ok(None),
+                Some(Value::Array(values)) if values.len() == 1 => &values[0],
+                Some(v) => v,
+            };
+            let (mut scalars, nan) = parse_scalars(&[value], raw_type, reinterpret_type)?;
+            match (scalars.pop(), nan) {
+                (Some(scalar), false) => Ok(Some(scalar)),
+                _ => Err(format!("invalid {key} {value}")),
+            }
+        };
+        let (min, max) = match attrs.get("valid_range") {
+            None => (bound("valid_min")?, bound("valid_max")?),
+            Some(_) if attrs.contains_key("valid_min") || attrs.contains_key("valid_max") => {
+                return Err("valid_range can't be combined with valid_min or valid_max".into())
+            }
+            Some(Value::Array(range)) if range.len() == 2 => {
+                let (mut scalars, nan) =
+                    parse_scalars(&[&range[0], &range[1]], raw_type, reinterpret_type)?;
+                if nan || scalars.len() != 2 {
+                    return Err(format!("invalid valid_range {range:?}"));
+                }
+                let max = scalars.pop();
+                (scalars.pop(), max)
+            }
+            Some(other) => return Err(format!("invalid valid_range {other}")),
+        };
+
+        if values.is_none() && !nan_is_null && min.is_none() && max.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            values,
+            nan_is_null,
+            min,
+            max,
+        }))
+    }
+
+    // the array is in the packed type.
+    fn apply(&self, arr: ArrayRef) -> ZarrQueryResult<ArrayRef> {
+        // true where the row becomes null.
+        let mut nulls = match self.nan_is_null {
+            true => is_nan(&arr)?,
+            false => BooleanArray::from(vec![false; arr.len()]),
+        };
+        for value in self.values.iter().flatten() {
+            nulls = or(&nulls, &eq(&arr, value)?)?;
+        }
+        if let Some(min) = &self.min {
+            nulls = or(&nulls, &lt(&arr, min)?)?;
+        }
+        if let Some(max) = &self.max {
+            nulls = or(&nulls, &gt(&arr, max)?)?;
+        }
+        Ok(nullif(&arr, &nulls)?)
+    }
+}
+
+fn is_nan(arr: &ArrayRef) -> ZarrQueryResult<BooleanArray> {
+    match arr.data_type() {
+        DataType::Float32 => Ok(BooleanArray::from_unary(
+            arr.as_primitive::<Float32Type>(),
+            |v| v.is_nan(),
+        )),
+        DataType::Float64 => Ok(BooleanArray::from_unary(
+            arr.as_primitive::<Float64Type>(),
+            |v| v.is_nan(),
+        )),
+        other => Err(ZarrQueryError::InvalidCompute(format!(
+            "NaN mask on a non float array of type {other}"
+        ))),
+    }
+}
+
+// the integer type of the same width with the other signedness, for
+// _Unsigned "true" on signed integers or "false" on unsigned integers.
+// otherwise there's nothing to reinterpret.
+fn reinterpret_type(raw_type: &DataType, value: &Value) -> Result<Option<DataType>, String> {
+    let unsigned = match value {
+        Value::Bool(b) => *b,
+        Value::String(s) if s.eq_ignore_ascii_case("true") => true,
+        Value::String(s) if s.eq_ignore_ascii_case("false") => false,
+        other => return Err(format!("invalid _Unsigned value {other}")),
+    };
+    if !raw_type.is_integer() {
+        return Err(format!(
+            "_Unsigned is only supported on int arrays, not {raw_type}"
+        ));
+    }
+    Ok(match (unsigned, raw_type) {
+        (true, DataType::Int8) => Some(DataType::UInt8),
+        (true, DataType::Int16) => Some(DataType::UInt16),
+        (true, DataType::Int32) => Some(DataType::UInt32),
+        (true, DataType::Int64) => Some(DataType::UInt64),
+        (false, DataType::UInt8) => Some(DataType::Int8),
+        (false, DataType::UInt16) => Some(DataType::Int16),
+        (false, DataType::UInt32) => Some(DataType::Int32),
+        (false, DataType::UInt64) => Some(DataType::Int64),
+        _ => None,
+    })
+}
+
+// reinterprets the bits of an integer array as another integer type of the
+// same width.
+fn reinterpret(arr: ArrayRef, data_type: &DataType) -> ZarrQueryResult<ArrayRef> {
+    let data = arr
+        .to_data()
+        .into_builder()
+        .data_type(data_type.clone())
+        .build()?;
+    Ok(make_array(data))
+}
+
+// the values as scalars of the reinterpreted type (or the raw type when
+// there's no reinterpretation), and whether one of them is NaN, which is
+// left out of the scalars. the values are in the raw type, values that don't
+// fit it are an error.
+fn parse_scalars(
+    values: &[&Value],
+    raw_type: &DataType,
+    reinterpret_type: Option<&DataType>,
+) -> Result<(Vec<Scalar<ArrayRef>>, bool), String> {
+    let to_err = |e: ZarrQueryError| e.to_string();
+
+    // the values are cast as one array, which validates them all at once,
+    // then split into scalars.
+    let to_scalars = |arr: ArrayRef| -> Vec<Scalar<ArrayRef>> {
+        (0..arr.len())
+            .map(|i| Scalar::new(arr.slice(i, 1)))
+            .collect()
+    };
+
+    // _Unsigned only applies to integers, so floats are never reinterpreted.
+    if raw_type.is_floating() {
+        let mut floats = Vec::with_capacity(values.len());
+        let mut nan = false;
+        for v in values {
+            let f = json_to_f64(v).ok_or_else(|| format!("invalid value {v}"))?;
+            match f.is_nan() {
+                true => nan = true,
+                false => floats.push(f),
+            }
+        }
+        let arr: ArrayRef = Arc::new(Float64Array::from(floats));
+        let arr = cast(&arr, raw_type).map_err(|e| to_err(e.into()))?;
+        return Ok((to_scalars(arr), nan));
+    }
+
+    if !raw_type.is_integer() {
+        return Err(format!(
+            "fill values and valid ranges are not supported on {raw_type} arrays"
+        ));
+    }
+
+    // the values are written in the raw type, like the data, and
+    // reinterpreted the same way.
+    let mut arr = int_array(values, raw_type)?;
+    if let Some(t) = reinterpret_type {
+        arr = reinterpret(arr, t).map_err(to_err)?;
+    }
+    Ok((to_scalars(arr), false))
+}
+
+// an integer array of the given type, from json integers. floats are
+// accepted when they have no fractional part, e.g. -9999.0.
+fn int_array(values: &[&Value], data_type: &DataType) -> Result<ArrayRef, String> {
+    let invalid = |v: &Value| format!("invalid fill value {v} for type {data_type}");
+    let options = CastOptions {
+        safe: false,
+        ..Default::default()
+    };
+
+    let arr: ArrayRef = if data_type.is_unsigned_integer() {
+        let ints = values
+            .iter()
+            .map(|v| {
+                v.as_u64()
+                    .or_else(|| {
+                        v.as_f64()
+                            .filter(|f| f.fract() == 0.0 && *f >= 0.0)
+                            .map(|f| f as u64)
+                    })
+                    .ok_or_else(|| invalid(v))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Arc::new(UInt64Array::from(ints))
+    } else {
+        let ints = values
+            .iter()
+            .map(|v| {
+                v.as_i64()
+                    .or_else(|| v.as_f64().filter(|f| f.fract() == 0.0).map(|f| f as i64))
+                    .ok_or_else(|| invalid(v))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Arc::new(Int64Array::from(ints))
+    };
+    cast_with_options(&arr, data_type, &options)
+        .map_err(|_| format!("fill values {values:?} don't fit in type {data_type}"))
+}
+
+// a float from a json number, a special value string ("NaN", "Infinity",
+// "-Infinity"), or the base64 of the 8 little endian bytes of an f64, which
+// is how xarray writes float fill values in zarr v3.
+fn json_to_f64(value: &Value) -> Option<f64> {
+    match value {
+        Value::Number(n) => n.as_f64(),
+        Value::String(s) => match s.as_str() {
+            "NaN" => Some(f64::NAN),
+            "Infinity" => Some(f64::INFINITY),
+            "-Infinity" => Some(f64::NEG_INFINITY),
+            s => {
+                let bytes = BASE64_STANDARD.decode(s).ok()?;
+                Some(f64::from_le_bytes(bytes.try_into().ok()?))
+            }
+        },
+        _ => None,
+    }
+}
+
+// an optional float attribute, a single element list is accepted too since
+// netcdf attributes are often stored that way.
+fn attr_f64(attrs: &Map<String, Value>, key: &str) -> Result<Option<f64>, String> {
+    let value = match attrs.get(key) {
+        None => return Ok(None),
+        Some(Value::Array(values)) if values.len() == 1 => &values[0],
+        Some(v) => v,
+    };
+    value
+        .as_f64()
+        .map(Some)
+        .ok_or_else(|| format!("invalid {key} {value}"))
+}
+
+//***************************************************
+// Transforms the data read from an array, based on the CF and
+// NetCDF conventions in the array's attributes. the transformations
+// are applied in the same order as xarray.
+//***************************************************
+pub(crate) struct DataTransformer {
+    // the type of the arrays read from the store, before any transformation.
+    raw_type: DataType,
+    nullable: bool,
+
+    // _Unsigned, the signed or unsigned integer type to reinterpret as.
+    reinterpret_type: Option<DataType>,
+
+    // _FillValue, missing_value and the valid range.
+    mask: Option<DataMask>,
+
+    // dtype "bool", integers become booleans.
+    to_bool: bool,
+
+    scale_factor: Option<f64>,
+    add_offset: Option<f64>,
+
+    // any time or duration convertion from attributes.
+    time: Option<TimeConversion>,
+}
+
+impl DataTransformer {
+    // the field has the raw type of the array, as read from the store.
+    pub(crate) fn new(field: &Field, attrs: &Map<String, Value>) -> ZarrQueryResult<Self> {
+        let raw_type = field.data_type().clone();
+        let name = field.name();
+        let invalid = |msg: &str| ZarrQueryError::InvalidMetadata(format!("Array {name}: {msg}"));
+
+        let reinterpret_type = match attrs.get("_Unsigned") {
+            None => None,
+            Some(v) => reinterpret_type(&raw_type, v).map_err(|msg| invalid(&msg))?,
+        };
+
+        let mask = DataMask::new(attrs, &raw_type, reinterpret_type.as_ref())
+            .map_err(|msg| invalid(&msg))?;
+
+        // bool conversion and scale/offsets, which are mutually exclusive
+        // so checked together.
+        let to_bool = attrs.get("dtype").and_then(Value::as_str) == Some("bool");
+        let scale_factor = attr_f64(attrs, "scale_factor").map_err(|msg| invalid(&msg))?;
+        let add_offset = attr_f64(attrs, "add_offset").map_err(|msg| invalid(&msg))?;
+
+        // attributes that transform an int or float to a time or duration.
+        let units = attrs.get("units").and_then(Value::as_str);
+        let is_timedelta = attrs
+            .get("dtype")
+            .and_then(Value::as_str)
+            .is_some_and(|d| d.starts_with("timedelta64"));
+        let time = match units {
+            Some(units) if units.to_lowercase().contains(" since ") => {
+                let calendar = attrs.get("calendar").and_then(Value::as_str);
+                Some(TimeConversion::time_since(units, calendar)?)
+            }
+            Some(units) if is_timedelta => Some(TimeConversion::duration(units)?),
+            _ => None,
+        };
+
+        let transformer = Self {
+            raw_type,
+            nullable: field.is_nullable(),
+            reinterpret_type,
+            mask,
+            to_bool,
+            scale_factor,
+            add_offset,
+            time,
+        };
+        transformer.validate().map_err(|msg| invalid(&msg))?;
+        Ok(transformer)
+    }
+
+    // final validation on the build transformer.
+    fn validate(&self) -> Result<(), String> {
+        let unpack = self.scale_factor.is_some() || self.add_offset.is_some();
+        let any = self.reinterpret_type.is_some()
+            || self.mask.is_some()
+            || self.to_bool
+            || unpack
+            || self.time.is_some();
+        let numeric = self.raw_type.is_integer() || self.raw_type.is_floating();
+        if any && !numeric {
+            return Err(format!(
+                "CF attributes are only supported on int and float arrays, not {}",
+                self.raw_type
+            ));
+        }
+
+        if self.to_bool {
+            if !self.packed_type().is_integer() {
+                return Err("dtype bool is only supported on int arrays".into());
+            }
+            if unpack || self.time.is_some() {
+                return Err("dtype bool can't be combined with unpacking or time units".into());
+            }
+        }
+
+        // the values the time conversion sees, floats can be NaN.
+        let time_input_is_float = unpack || self.packed_type().is_floating();
+        let can_be_null = self.mask.is_some() || (self.time.is_some() && time_input_is_float);
+        if can_be_null && !self.nullable {
+            return Err("the attributes can produce nulls, but the field isn't nullable".into());
+        }
+        Ok(())
+    }
+
+    fn packed_type(&self) -> &DataType {
+        self.reinterpret_type.as_ref().unwrap_or(&self.raw_type)
+    }
+
+    fn output_type(&self) -> DataType {
+        if let Some(time) = &self.time {
+            time.data_type()
+        } else if self.to_bool {
+            DataType::Boolean
+        } else if self.scale_factor.is_some() || self.add_offset.is_some() {
+            DataType::Float64
+        } else {
+            self.packed_type().clone()
+        }
+    }
+
+    // the field as it is after the transformations, from the raw field.
+    pub(crate) fn output_field(&self, field: &Field) -> Field {
+        field.clone().with_data_type(self.output_type())
+    }
+
+    // the array must be of the raw type, i.e. read from the array this
+    // transformer was built for.
+    pub(crate) fn apply(&self, mut arr: ArrayRef) -> ZarrQueryResult<ArrayRef> {
+        if arr.data_type() != &self.raw_type {
+            return Err(ZarrQueryError::InvalidCompute(format!(
+                "Expected an array of type {} to transform, got {}",
+                self.raw_type,
+                arr.data_type()
+            )));
+        }
+
+        if let Some(t) = &self.reinterpret_type {
+            arr = reinterpret(arr, t)?;
+        }
+        if let Some(mask) = &self.mask {
+            arr = mask.apply(arr)?;
+        }
+        if self.to_bool {
+            arr = cast(&arr, &DataType::Boolean)?;
+        }
+        if self.scale_factor.is_some() || self.add_offset.is_some() {
+            let scale = self.scale_factor.unwrap_or(1.0);
+            let offset = self.add_offset.unwrap_or(0.0);
+            let floats = cast(&arr, &DataType::Float64)?;
+            let unpacked: Float64Array = floats
+                .as_primitive::<Float64Type>()
+                .unary(|v| v * scale + offset);
+            arr = Arc::new(unpacked);
+        }
+        if let Some(time) = &self.time {
+            arr = time.convert(arr)?;
+        }
+        Ok(arr)
+    }
+}
+
+//***************************************************
 // The interface to an array in a zarr store.
 //***************************************************
 struct ArrayInterface<T: AsyncReadableListableStorageTraits + ?Sized> {
     name: String,
     arr: Arc<Array<T>>,
+    transformer: Arc<DataTransformer>,
     chk_index: Vec<u64>,
 
     // the real chunk shape, adjusted for the array edges, and a flag
@@ -398,7 +1130,8 @@ impl<T: AsyncReadableListableStorageTraits + ?Sized + 'static> ArrayInterface<T>
             )?,
             BytesFromArray::Decoded(bytes) => bytes,
         };
-        array_bytes_to_arrow(self.arr.data_type(), decoded_bytes)
+        let raw = array_bytes_to_arrow(self.arr.data_type(), decoded_bytes)?;
+        self.transformer.apply(raw)
     }
 }
 
@@ -442,8 +1175,9 @@ pub(crate) struct ZarrStoreInterface<T: AsyncReadableListableStorageTraits + ?Si
     coords: HashMap<String, BroadcastableCoord>,
     grid: ChunkGrid,
 
-    // non 1D coordinate arrays only.
-    arrays: HashMap<String, Arc<Array<T>>>,
+    // non 1D coordinate arrays only, with the transformations of their
+    // attributes. the coordinates are transformed once, when they're read.
+    arrays: HashMap<String, (Arc<Array<T>>, Arc<DataTransformer>)>,
 
     // offloads reading data to a dedicated i/o runtime.
     io_runtime: IoRuntime,
@@ -470,10 +1204,13 @@ impl<T: AsyncReadableListableStorageTraits + ?Sized + 'static> ZarrStoreInterfac
         };
         let cols = schema_ref.fields().column_names();
 
-        // each coordinate's name, field, array, and its own 1D chunk grid.
-        let mut coord_arrays: Vec<(String, FieldRef, Array<T>, ChunkGrid)> = Vec::new();
+        // each coordinate's name, field, array, transformer, and its own 1D
+        // chunk grid.
+        let mut coord_arrays: Vec<(String, FieldRef, Array<T>, DataTransformer, ChunkGrid)> =
+            Vec::new();
 
-        let mut data_arrays: HashMap<String, Arc<Array<T>>> = HashMap::new();
+        let mut data_arrays: HashMap<String, (Arc<Array<T>>, Arc<DataTransformer>)> =
+            HashMap::new();
         let mut data_meta: Option<DataArraysMeta> = None;
 
         // for each col in the schema, determine if it's a 1d coord or not.
@@ -488,30 +1225,30 @@ impl<T: AsyncReadableListableStorageTraits + ?Sized + 'static> ZarrStoreInterfac
                 ))?
                 .to_string();
             let arr = Array::async_open(store.clone(), &path).await?;
+            let (_, field) = schema_ref.fields().find(col).ok_or_else(|| {
+                ZarrQueryError::InvalidColumnRequest(format!("Array {col} is not in the schema"))
+            })?;
+            let transformer = data_transformer(field, &arr)?;
             if is_1d_coordinate(col, &arr)? {
-                let (_, field) = schema_ref.fields().find(col).ok_or_else(|| {
-                    ZarrQueryError::InvalidColumnRequest(format!(
-                        "Coordinate {col} is not in the schema"
-                    ))
-                })?;
                 let grid = ChunkGrid::from_array(&arr)?;
-                coord_arrays.push((col.to_string(), field.clone(), arr, grid));
+                coord_arrays.push((col.to_string(), field.clone(), arr, transformer, grid));
             } else {
                 match &data_meta {
                     Some(meta) => meta.validate(col, &arr)?,
                     None => data_meta = Some(DataArraysMeta::new(&arr)?),
                 }
-                data_arrays.insert(col.to_string(), Arc::new(arr));
+                data_arrays.insert(col.to_string(), (Arc::new(arr), Arc::new(transformer)));
             }
         }
 
-        let reads = coord_arrays
-            .into_iter()
-            .map(|(name, field, arr, grid)| async move {
-                // here the full 1d coordinate data is read.
-                let values = read_full_array(&arr).await?;
-                Ok::<_, ZarrQueryError>((name, field, values, grid))
-            });
+        let reads =
+            coord_arrays
+                .into_iter()
+                .map(|(name, field, arr, transformer, grid)| async move {
+                    // here the full 1d coordinate data is read, and transformed.
+                    let values = transformer.apply(read_full_array(&arr).await?)?;
+                    Ok::<_, ZarrQueryError>((name, field, values, grid))
+                });
         let read_coords = metrics
             .time_io(futures::future::try_join_all(reads))
             .await?;
@@ -589,7 +1326,7 @@ impl<T: AsyncReadableListableStorageTraits + ?Sized + 'static> ZarrStoreInterfac
         let is_edge = self.grid.is_edge(chk_idx);
         cols.iter()
             .map(|col| {
-                let arr = self
+                let (arr, transformer) = self
                     .arrays
                     .get(col)
                     .ok_or_else(|| ZarrQueryError::array_not_in_store(col))?
@@ -597,6 +1334,7 @@ impl<T: AsyncReadableListableStorageTraits + ?Sized + 'static> ZarrStoreInterfac
                 Ok(ArrayInterface {
                     name: col.to_string(),
                     arr,
+                    transformer,
                     chk_index: chk_idx.to_vec(),
                     chunk_shape: chunk_shape.clone(),
                     is_edge,
@@ -965,6 +1703,27 @@ fn dim_names<T: ?Sized>(arr: &Array<T>) -> ZarrQueryResult<Option<Vec<String>>> 
         .transpose()
 }
 
+// the transformer for an array, from the array's raw type and attributes.
+// the field is from the schema, so it has the output type, which has to
+// match what the transformer produces.
+fn data_transformer<T: ?Sized>(field: &Field, arr: &Array<T>) -> ZarrQueryResult<DataTransformer> {
+    let raw_field = Field::new(
+        field.name(),
+        arrow_type(arr.data_type())?,
+        field.is_nullable(),
+    );
+    let transformer = DataTransformer::new(&raw_field, arr.attributes())?;
+    let output_type = transformer.output_field(&raw_field).data_type().clone();
+    if &output_type != field.data_type() {
+        return Err(ZarrQueryError::InvalidMetadata(format!(
+            "Array {} has type {output_type} after transformations, but the schema expects {}",
+            field.name(),
+            field.data_type()
+        )));
+    }
+    Ok(transformer)
+}
+
 fn is_1d_coordinate<T: ?Sized>(name: &str, arr: &Array<T>) -> ZarrQueryResult<bool> {
     Ok(is_1d_coordinate_from_meta(
         name,
@@ -1052,6 +1811,58 @@ fn array_bytes_to_arrow(t: &zDataType, bytes: ArrayBytes<'_>) -> ZarrQueryResult
         Err(ZarrQueryError::InvalidType(format!(
             "Unsupported type {t} from zarr metadata"
         )))
+    }
+}
+
+// the arrow type of the arrays read from a zarr array of the given type, i.e.
+// the type that `array_bytes_to_arrow` produces.
+pub(crate) fn arrow_type(t: &zDataType) -> ZarrQueryResult<DataType> {
+    if t.is::<BoolDataType>() {
+        Ok(DataType::Boolean)
+    } else if t.is::<UInt8DataType>() {
+        Ok(DataType::UInt8)
+    } else if t.is::<UInt16DataType>() {
+        Ok(DataType::UInt16)
+    } else if t.is::<UInt32DataType>() {
+        Ok(DataType::UInt32)
+    } else if t.is::<UInt64DataType>() {
+        Ok(DataType::UInt64)
+    } else if t.is::<Int8DataType>() {
+        Ok(DataType::Int8)
+    } else if t.is::<Int16DataType>() {
+        Ok(DataType::Int16)
+    } else if t.is::<Int32DataType>() {
+        Ok(DataType::Int32)
+    } else if t.is::<Int64DataType>() {
+        Ok(DataType::Int64)
+    } else if t.is::<Float32DataType>() {
+        Ok(DataType::Float32)
+    } else if t.is::<Float64DataType>() {
+        Ok(DataType::Float64)
+    } else if t.is::<StringDataType>() {
+        Ok(DataType::Utf8)
+    } else if let Some(dt) = t.downcast_ref::<NumpyDateTime64DataType>() {
+        ensure_unit_scale(t, dt.scale_factor.get())?;
+        Ok(DataType::Timestamp(arrow_time_unit(t, dt.unit)?, None))
+    } else if let Some(dt) = t.downcast_ref::<NumpyTimeDelta64DataType>() {
+        ensure_unit_scale(t, dt.scale_factor.get())?;
+        Ok(DataType::Duration(arrow_time_unit(t, dt.unit)?))
+    } else {
+        Err(ZarrQueryError::InvalidType(format!(
+            "Unsupported type {t} from zarr metadata"
+        )))
+    }
+}
+
+fn arrow_time_unit(t: &zDataType, unit: NumpyTimeUnit) -> ZarrQueryResult<TimeUnit> {
+    match unit {
+        NumpyTimeUnit::Second => Ok(TimeUnit::Second),
+        NumpyTimeUnit::Millisecond => Ok(TimeUnit::Millisecond),
+        NumpyTimeUnit::Microsecond => Ok(TimeUnit::Microsecond),
+        NumpyTimeUnit::Nanosecond => Ok(TimeUnit::Nanosecond),
+        _ => Err(ZarrQueryError::InvalidType(format!(
+            "Unsupported unit {unit} for type {t} from zarr metadata"
+        ))),
     }
 }
 

@@ -172,7 +172,7 @@ mod table_provider_tests {
 
     use arrow::array::AsArray;
     use arrow::compute::concat_batches;
-    use arrow::datatypes::Float64Type;
+    use arrow::datatypes::{DurationNanosecondType, Float64Type, TimestampNanosecondType};
     use arrow_schema::DataType;
     use datafusion::assert_batches_sorted_eq;
     use datafusion::execution::SessionStateBuilder;
@@ -190,7 +190,8 @@ mod table_provider_tests {
     use crate::table::config::IcechunkVersion;
     use crate::table::table_provider::ZarrTable;
     use crate::test_utils::{
-        extract_col, get_local_zarr_store, validate_names_and_types, validate_primitive_column,
+        extract_col, get_local_zarr_store, get_local_zarr_store_cf_times, validate_names_and_types,
+        validate_primitive_column,
     };
     #[cfg(feature = "icechunk")]
     use crate::test_utils::{get_local_icechunk_repo, get_local_icechunk_repo_multiple_commits};
@@ -288,6 +289,39 @@ mod table_provider_tests {
 
             read_and_validate(table, 0.0).await;
         }
+    }
+
+    // the cf encoded times are queried as timestamps and durations.
+    #[tokio::test]
+    async fn query_cf_times_test() {
+        let (wrapper, _) = get_local_zarr_store_cf_times("cf_times_data_for_provider").await;
+        let session = SessionContext::new();
+        session
+            .register_table(
+                "zarr_table",
+                Arc::new(zarr_table_from_path(wrapper.get_store_path()).await),
+            )
+            .unwrap();
+
+        let query = "
+            SELECT time1, time2, duration
+            FROM zarr_table
+            WHERE time1 = TIMESTAMP '2023-01-01T00:00:00'
+        ";
+        let batches = session.sql(query).await.unwrap().collect().await.unwrap();
+        let schema = batches[0].schema();
+        let batch = concat_batches(&schema, &batches).unwrap();
+        assert_eq!(batch.num_rows(), 1);
+
+        // 2023-01-01 in nanoseconds since the epoch, and 10000 minutes.
+        let jan_2023 = 1_672_531_200 * 1_000_000_000;
+        validate_primitive_column::<TimestampNanosecondType, i64>("time1", &batch, &[jan_2023]);
+        validate_primitive_column::<TimestampNanosecondType, i64>("time2", &batch, &[jan_2023]);
+        validate_primitive_column::<DurationNanosecondType, i64>(
+            "duration",
+            &batch,
+            &[10_000 * 60 * 1_000_000_000],
+        );
     }
 
     // reads the same icechunk repo at three different versions (a snapshot id, a

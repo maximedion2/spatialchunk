@@ -16,18 +16,12 @@ use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef, TimeUnit};
+use arrow_schema::{Field, Fields, Schema, SchemaRef};
 use datafusion::common::stats::Precision;
 use datafusion::common::Statistics;
 use datafusion::datasource::listing::ListingTableUrl;
 use datafusion::error::{DataFusionError, Result as DfResult};
-use zarrs::array::data_type::{
-    BoolDataType, Float32DataType, Float64DataType, Int16DataType, Int32DataType, Int64DataType,
-    Int8DataType, NumpyDateTime64DataType, NumpyTimeDelta64DataType, StringDataType,
-    UInt16DataType, UInt32DataType, UInt64DataType, UInt8DataType,
-};
-use zarrs::array::{Array, DataType as zarr_dtype};
-use zarrs::metadata_ext::data_type::NumpyTimeUnit;
+use zarrs::array::Array;
 use zarrs::node::{async_get_child_nodes, NodeMetadata, NodePath};
 // the icechunk crate is used via zarrs_icechunk's re-export (rather than
 // a direct dependency) to keep the two in lockstep.
@@ -43,7 +37,6 @@ use zarrs_icechunk::icechunk::config::{
 use zarrs_icechunk::icechunk::{ObjectStorage, Repository};
 #[cfg(feature = "icechunk")]
 use zarrs_icechunk::AsyncIcechunkStore;
-use zarrs_metadata::v3::MetadataV3;
 use zarrs_metadata::ArrayMetadata;
 // object_store is sourced from zarrs_object_store's re-export here (rather
 // than a direct dependency) because these stores are wrapped in
@@ -57,7 +50,9 @@ use zarrs_object_store::AsyncObjectStore;
 use zarrs_storage::AsyncReadableListableStorageTraits;
 
 use crate::zarr_store_opener::util::NumElements;
-use crate::zarr_store_opener::zarr_store_interface::is_1d_coordinate_from_meta;
+use crate::zarr_store_opener::zarr_store_interface::{
+    arrow_type, is_1d_coordinate_from_meta, DataTransformer,
+};
 
 // Cached, projection-independent ingredients for computing scan statistics.
 #[derive(Clone, Debug, Default)]
@@ -496,12 +491,11 @@ impl ZarrTableUrl {
 
             let arr = Array::new_with_metadata(store.clone(), &array_path, array_meta)
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
-            let meta = match arr.metadata() {
-                ArrayMetadata::V3(meta) => Ok(meta),
-                _ => Err(DataFusionError::Execution(
+            if !matches!(arr.metadata(), ArrayMetadata::V3(_)) {
+                return Err(DataFusionError::Execution(
                     "Only Zarr v3 metadata is supported".into(),
-                )),
-            }?;
+                ));
+            }
 
             // capture the array's shape and dimension names for statistics.
             let dim_names: Option<Vec<String>> = arr
@@ -510,79 +504,17 @@ impl ZarrTableUrl {
                 .and_then(|names| names.into_iter().collect::<Option<Vec<String>>>());
             stats_base.add_array(&field_name, arr.shape(), dim_names);
 
-            fields.push(Field::new(
-                field_name,
-                get_schema_type(&meta.data_type)?,
-                true,
-            ));
+            // the schema has the types after the cf attributes transformations,
+            // the raw types are only known by the arrays.
+            let raw_type =
+                arrow_type(arr.data_type()).map_err(|e| DataFusionError::External(Box::new(e)))?;
+            let raw_field = Field::new(field_name, raw_type, true);
+            let transformer = DataTransformer::new(&raw_field, arr.attributes())
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            fields.push(transformer.output_field(&raw_field));
         }
 
         Ok((Arc::new(Schema::new(Fields::from(fields))), stats_base))
-    }
-}
-
-fn get_schema_type(value: &MetadataV3) -> DfResult<DataType> {
-    let data_type =
-        zarr_dtype::from_metadata(value).map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-    if data_type.is::<BoolDataType>() {
-        Ok(DataType::Boolean)
-    } else if data_type.is::<UInt8DataType>() {
-        Ok(DataType::UInt8)
-    } else if data_type.is::<UInt16DataType>() {
-        Ok(DataType::UInt16)
-    } else if data_type.is::<UInt32DataType>() {
-        Ok(DataType::UInt32)
-    } else if data_type.is::<UInt64DataType>() {
-        Ok(DataType::UInt64)
-    } else if data_type.is::<Int8DataType>() {
-        Ok(DataType::Int8)
-    } else if data_type.is::<Int16DataType>() {
-        Ok(DataType::Int16)
-    } else if data_type.is::<Int32DataType>() {
-        Ok(DataType::Int32)
-    } else if data_type.is::<Int64DataType>() {
-        Ok(DataType::Int64)
-    } else if data_type.is::<Float32DataType>() {
-        Ok(DataType::Float32)
-    } else if data_type.is::<Float64DataType>() {
-        Ok(DataType::Float64)
-    } else if data_type.is::<StringDataType>() {
-        Ok(DataType::Utf8)
-    } else if let Some(dt) = data_type.downcast_ref::<NumpyDateTime64DataType>() {
-        Ok(DataType::Timestamp(
-            map_time_unit(dt.unit, dt.scale_factor.get())?,
-            None,
-        ))
-    } else if let Some(dt) = data_type.downcast_ref::<NumpyTimeDelta64DataType>() {
-        Ok(DataType::Duration(map_time_unit(
-            dt.unit,
-            dt.scale_factor.get(),
-        )?))
-    } else {
-        Err(DataFusionError::Execution(format!(
-            "Unsupported type {value} from zarr metadata"
-        )))
-    }
-}
-
-// maps a numpy temporal unit to an arrow [`TimeUnit`], requiring an exact match and a
-// scale factor of 1. arrow can't represent the coarser/finer numpy units or a scale
-// multiplier, so anything else is an error.
-fn map_time_unit(unit: NumpyTimeUnit, scale_factor: u32) -> DfResult<TimeUnit> {
-    if scale_factor != 1 {
-        return Err(DataFusionError::Execution(format!(
-            "Unsupported scale factor {scale_factor} for temporal type from zarr metadata"
-        )));
-    }
-    match unit {
-        NumpyTimeUnit::Second => Ok(TimeUnit::Second),
-        NumpyTimeUnit::Millisecond => Ok(TimeUnit::Millisecond),
-        NumpyTimeUnit::Microsecond => Ok(TimeUnit::Microsecond),
-        NumpyTimeUnit::Nanosecond => Ok(TimeUnit::Nanosecond),
-        _ => Err(DataFusionError::Execution(format!(
-            "Unsupported temporal unit {unit} from zarr metadata"
-        ))),
     }
 }
 

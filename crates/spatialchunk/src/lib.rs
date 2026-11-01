@@ -102,8 +102,9 @@ mod test_utils {
     use futures::executor::block_on;
     use itertools::enumerate;
     use ndarray::{Array, Array1, Array2, Array3, Array4};
+    use serde_json::{json, Map, Value};
     use walkdir::WalkDir;
-    use zarrs::array::data_type::{float64, numpy_datetime64};
+    use zarrs::array::data_type::{float64, int64, numpy_datetime64};
     use zarrs::array::{codec, ArrayBuilder, ArraySubset, DataType, Element, FillValue};
     #[cfg(feature = "icechunk")]
     use zarrs::group::GroupBuilder;
@@ -263,6 +264,7 @@ mod test_utils {
         store: Arc<dyn AsyncReadableWritableListableStorageTraits>,
         path: &str,
         dimensions: Option<Vec<String>>,
+        attributes: Option<Map<String, Value>>,
     ) where
         T: Element + Clone + Send + Sync,
         FillValue: From<T>,
@@ -274,6 +276,9 @@ mod test_utils {
         builder_ref = builder_ref.bytes_to_bytes_codecs(vec![Arc::new(codec)]);
         if let Some(dimensions) = dimensions {
             builder_ref = builder_ref.dimension_names(dimensions.into());
+        }
+        if let Some(attributes) = attributes {
+            builder_ref = builder_ref.attributes(attributes);
         }
 
         let arr = builder_ref.build(store, path).unwrap();
@@ -305,6 +310,7 @@ mod test_utils {
             store,
             path,
             dimensions,
+            None,
         )
         .await;
     }
@@ -697,6 +703,7 @@ mod test_utils {
             store.clone(),
             "/time",
             Some(vec!["time".into()]),
+            None,
         )
         .await;
 
@@ -788,6 +795,136 @@ mod test_utils {
         let schema = Arc::new(Schema::new(vec![
             Field::new("data_1", ArrowDataType::Float64, true),
             Field::new("data_2", ArrowDataType::Float64, true),
+        ]));
+
+        (wrapper, schema)
+    }
+
+    // an int64 data1 (1 to 5) and a float64 data2 (10.0 to 50.0), with the
+    // given attributes. the schema has the raw types, the attributes are up
+    // to the test.
+    pub(crate) async fn get_local_zarr_store_with_attrs(
+        data1_attrs: Option<Map<String, Value>>,
+        data2_attrs: Option<Map<String, Value>>,
+        dir_name: &str,
+    ) -> (LocalZarrStoreWrapper, SchemaRef) {
+        let wrapper = LocalZarrStoreWrapper::new(dir_name.into());
+        let store = wrapper.get_store();
+
+        let data1: Vec<i64> = (1..=5).collect();
+        write_1d_array(
+            data1,
+            int64(),
+            0,
+            5,
+            2,
+            store.clone(),
+            "/data1",
+            None,
+            data1_attrs,
+        )
+        .await;
+
+        let data2: Vec<f64> = (1..=5).map(|i| i as f64 * 10.0).collect();
+        write_1d_array(
+            data2,
+            float64(),
+            0.0,
+            5,
+            2,
+            store.clone(),
+            "/data2",
+            None,
+            data2_attrs,
+        )
+        .await;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("data1", ArrowDataType::Int64, true),
+            Field::new("data2", ArrowDataType::Float64, true),
+        ]));
+
+        (wrapper, schema)
+    }
+
+    // cf encoded times and durations, time1 as int64 and time2 as float64
+    // seconds since the epoch, for jan 1 of 2020 to 2024, and an int64
+    // duration in minutes. the schema has the types after the conversions.
+    pub(crate) async fn get_local_zarr_store_cf_times(
+        dir_name: &str,
+    ) -> (LocalZarrStoreWrapper, SchemaRef) {
+        let wrapper = LocalZarrStoreWrapper::new(dir_name.into());
+        let store = wrapper.get_store();
+
+        let times: Vec<i64> = vec![
+            1_577_836_800,
+            1_609_459_200,
+            1_640_995_200,
+            1_672_531_200,
+            1_704_067_200,
+        ];
+        let attrs = json!({ "units": "seconds since 1970-01-01" });
+        write_1d_array(
+            times.clone(),
+            int64(),
+            0,
+            5,
+            2,
+            store.clone(),
+            "/time1",
+            None,
+            attrs.as_object().cloned(),
+        )
+        .await;
+
+        let attrs = json!({
+            "units": "seconds since 1970-01-01",
+            "calendar": "proleptic_gregorian",
+        });
+        write_1d_array(
+            times.iter().map(|t| *t as f64).collect(),
+            float64(),
+            0.0,
+            5,
+            2,
+            store.clone(),
+            "/time2",
+            None,
+            attrs.as_object().cloned(),
+        )
+        .await;
+
+        let durations: Vec<i64> = vec![10, 100, 1_000, 10_000, 100_000];
+        let attrs = json!({ "units": "minutes", "dtype": "timedelta64[ns]" });
+        write_1d_array(
+            durations,
+            int64(),
+            0,
+            5,
+            2,
+            store.clone(),
+            "/duration",
+            None,
+            attrs.as_object().cloned(),
+        )
+        .await;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "duration",
+                ArrowDataType::Duration(arrow_schema::TimeUnit::Nanosecond),
+                true,
+            ),
+            Field::new(
+                "time1",
+                ArrowDataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None),
+                true,
+            ),
+            Field::new(
+                "time2",
+                ArrowDataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None),
+                true,
+            ),
         ]));
 
         (wrapper, schema)
