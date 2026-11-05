@@ -25,6 +25,9 @@ base64 = { version = "0.22.1" }
 bytes = { version = "1.12.1" }
 chrono = { version = "0.4.42" }
 datafusion = { workspace = true }
+datafusion-datasource = { workspace = true }
+datafusion-datasource-parquet = { workspace = true }
+delegate = { version = "0.13.5" }
 futures = { version = "0.3.31" }
 futures-util = { version = "0.3.31" }
 geo-index = "0.3"
@@ -46,7 +49,12 @@ zarrs_object_store = { version = "0.6.2" }
 zarrs_storage = { version = "0.4.0", features = ["async"] }
 
 [dev-dependencies]
-parquet = { version = "55", features = ["arrow"] }
+# same version as datafusion's parquet. geospatial is for writing test files
+# with the parquet GEOMETRY logical type, it's also enabled on datafusion's
+# parquet in test builds (cargo unifies the features).
+# pinned to 58.3.x: parquet 58.4.0 needs parquet-geospatial 58.4.0, which isn't
+# published yet. datafusion only needs ^58.3.0, so it uses this version too.
+parquet = { version = "~58.3", features = ["arrow", "geospatial"] }
 geos = { version = "8" }
 walkdir = { version = "2.5.0" }
 

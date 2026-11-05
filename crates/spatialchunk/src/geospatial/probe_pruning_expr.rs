@@ -19,9 +19,11 @@ use arrow_schema::{DataType, Schema};
 use datafusion::common::ScalarValue;
 use datafusion::error::Result;
 use datafusion::logical_expr::ColumnarValue;
+use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_plan::PhysicalExpr;
 use geo_types::{Coord, Rect};
 
+use crate::geospatial::geos::boxed_geo_batch::inflate;
 use crate::geospatial::geos::{BBoxedGeoBatch, IndexedBuildSide};
 
 /// A physical expression that prunes probe-side chunks against the build-side
@@ -50,6 +52,35 @@ impl ProbePruningExpr {
             index,
             probe_side_buffer,
         }
+    }
+
+    // The probe geometry column, if the probe expression is a bare column, e.g.
+    // a geometry column read from a file, as opposed to st_point(lon, lat).
+    pub(crate) fn probe_column(&self) -> Option<&str> {
+        self.probe_expr.downcast_ref::<Column>().map(Column::name)
+    }
+
+    // Whether a probe bbox may intersect any build side geometry. used to prune
+    // with bboxes that are already known, e.g. from parquet statistics, where
+    // there's no record batch to evaluate. the buffer (Some for ST_DWithin)
+    // inflates the bbox, like in `evaluate`.
+    pub(crate) fn may_intersect(&self, rect: Rect<f64>) -> bool {
+        let rect = Rect::new(
+            Coord {
+                x: (rect.min().x as f32).next_down(),
+                y: (rect.min().y as f32).next_down(),
+            },
+            Coord {
+                x: (rect.max().x as f32).next_up(),
+                y: (rect.max().y as f32).next_up(),
+            },
+        );
+        let rect = match self.probe_side_buffer {
+            Some(buffer) => inflate(rect, buffer),
+            None => rect,
+        };
+        let (matches, _) = self.index.traverse(vec![rect], vec![0]);
+        !matches.is_empty()
     }
 }
 

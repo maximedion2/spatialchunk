@@ -18,4 +18,6 @@ arrow = { version = "58.3.0" }
 arrow-array = { version = "58.3.0" }
 arrow-schema = { version = "58.3.0" }
 datafusion = { version = "54.1.0" }
+datafusion-datasource = { version = "54.1.0" }
+datafusion-datasource-parquet = { version = "54.1.0" }
 tokio = { version = "1.46.1", features = ["rt", "macros", "net", "rt-multi-thread"] }

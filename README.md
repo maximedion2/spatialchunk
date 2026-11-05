@@ -34,7 +34,7 @@ See full example [here](crates/spatialchunk/examples/overture_era5_join.rs)
 - [x] Store level statistics
 - [x] Read/decompress metrics
 - [x] Limits
-- [ ] Attribute based transformations (in particular, handling timestamp types)
+- [x] Attribute based transformations (in particular, handling timestamp types)
 - [x] Parallelism via partitioning
 - [x] I/O and compute runtime split
 - [x] AWS s3 support
@@ -53,7 +53,7 @@ See full example [here](crates/spatialchunk/examples/overture_era5_join.rs)
 - [x] WKB and WKT support
 - [x] Optimizer logic to to convert NJLs to properly optimized spatial joins
 - [ ] Geoparquet 1.1 native GeoArrow encoding support
-- [ ] Spatial join pushdown to geoparquet files
+- [x] Spatial join pushdown to geoparquet files
 - [ ] Disk dumps when running out of ram
 - [ ] Support for partially materializing the build side 
 

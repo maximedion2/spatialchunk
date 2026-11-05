@@ -181,10 +181,12 @@ mod table_provider_tests {
     use futures_util::TryStreamExt;
 
     use super::*;
-    use crate::geospatial::test_utils::wkt_to_wkb;
+    use crate::geospatial::file_source::geoparquet_file_source::GeoParquetFormatFactory;
+    use crate::geospatial::test_utils::{wkt_to_wkb, write_geoparquet_covering};
     use crate::geospatial::udfs::st_point::StPointUdf;
     use crate::geospatial::{
-        SpatialJoinPhysicalOptimizer, StDWithinUdf, StGeomFromWkbUdf, StGeomFromWktUdf, StWithinUdf,
+        SpatialJoinPhysicalOptimizer, StDWithinUdf, StGeomFromWkbUdf, StGeomFromWktUdf,
+        StIntersectsUdf, StWithinUdf,
     };
     #[cfg(feature = "icechunk")]
     use crate::table::config::IcechunkVersion;
@@ -864,6 +866,58 @@ mod table_provider_tests {
                 "| 16.0 |", "| 17.0 |", "| 18.0 |", "| 2.0  |", "| 25.0 |", "| 38.0 |", "| 45.0 |",
                 "| 46.0 |", "| 47.0 |", "| 52.0 |", "| 53.0 |", "| 54.0 |", "| 55.0 |", "| 61.0 |",
                 "| 62.0 |", "| 63.0 |", "| 8.0  |", "| 9.0  |", "+------+",
+            ],
+            &batches
+        );
+    }
+
+    // a spatial join against a geoparquet table, read through the geoparquet
+    // format registered in place of the vanilla parquet one. the geometry
+    // column is used as is, without st_geomfromwkb, since the format labels
+    // it as a geometry.
+    #[tokio::test]
+    async fn geoparquet_join_test() {
+        let dir = write_geoparquet_covering("geoparquet_join");
+
+        let mut state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_physical_optimizer_rule(Arc::new(SpatialJoinPhysicalOptimizer))
+            .build();
+        state
+            .register_file_format(Arc::new(GeoParquetFormatFactory::default()), true)
+            .unwrap();
+        let session = SessionContext::new_with_state(state);
+        session.register_udf(ScalarUDF::from(StIntersectsUdf::default()));
+        session.register_udf(ScalarUDF::from(StGeomFromWktUdf::default()));
+
+        let query = format!(
+            "CREATE EXTERNAL TABLE squares STORED AS PARQUET LOCATION '{}/'",
+            dir.path_str()
+        );
+        session.sql(&query).await.unwrap();
+
+        // squares 3 and 4 shifted right and down by half a square. the first
+        // intersects squares 3 and 4, the second squares 4 and 5, so 4 shows
+        // up twice.
+        let query = "
+            WITH boxes AS (
+                SELECT st_geomfromwkt(wkt) AS geom
+                FROM (VALUES
+                    ('POLYGON((2.5 8.5, 3.5 8.5, 3.5 9.5, 2.5 9.5, 2.5 8.5))'),
+                    ('POLYGON((3.5 7.5, 4.5 7.5, 4.5 8.5, 3.5 8.5, 3.5 7.5))')
+                ) AS t(wkt)
+            )
+            SELECT s.data
+            FROM boxes b
+            JOIN squares s
+                ON st_intersects(s.geometry, b.geom)
+            ";
+        let batches = session.sql(query).await.unwrap().collect().await.unwrap();
+
+        assert_batches_sorted_eq!(
+            [
+                "+------+", "| data |", "+------+", "| 3    |", "| 4    |", "| 4    |", "| 5    |",
+                "+------+",
             ],
             &batches
         );
