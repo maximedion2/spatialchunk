@@ -10,6 +10,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub(crate) mod file_source;
 pub(crate) mod geos;
 pub(crate) mod join_predicates;
 pub(crate) mod probe_pruning_expr;

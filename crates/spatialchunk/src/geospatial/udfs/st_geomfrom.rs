@@ -28,12 +28,12 @@ use wkb::writer::{write_geometry, WriteOptions};
 use wkt::TryFromWkt;
 
 /// The Arrow field-metadata key for an extension type's name.
-const ARROW_EXTENSION_NAME_KEY: &str = "ARROW:extension:name";
+pub(crate) const ARROW_EXTENSION_NAME_KEY: &str = "ARROW:extension:name";
 
 /// The GeoArrow extension name that marks a binary column as WKB geometry. A
 /// column carrying this on its field metadata is treated as geometry; a bare
 /// binary column is not.
-const GEOARROW_WKB_EXTENSION_NAME: &str = "geoarrow.wkb";
+pub(crate) const GEOARROW_WKB_EXTENSION_NAME: &str = "geoarrow.wkb";
 
 /// Builds an output `Field` for a geometry column: the given storage type tagged
 /// with the `geoarrow.wkb` extension name so downstream operations recognize it.

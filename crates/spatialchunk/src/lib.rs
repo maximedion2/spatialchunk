@@ -27,6 +27,7 @@ mod session {
     use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
     use datafusion::prelude::{SessionConfig, SessionContext};
 
+    use crate::geospatial::file_source::geoparquet_file_source::GeoParquetFormatFactory;
     use crate::geospatial::{
         SpatialJoinPhysicalOptimizer, StAreaUdf, StContainsUdf, StCoveredByUdf, StCoversUdf,
         StDWithinUdf, StDistanceUdf, StGeomFromWkbUdf, StGeomFromWktUdf, StIntersectsUdf,
@@ -59,6 +60,9 @@ mod session {
             .with_default_features()
             .with_physical_optimizer_rules(rules)
             .build();
+        // replaces the vanilla parquet format (same extension), so that STORED
+        // AS PARQUET reads geoparquet. plain parquet files read as before.
+        state.register_file_format(Arc::new(GeoParquetFormatFactory::default()), true)?;
         state
             .table_factories_mut()
             .insert("ZARR_STORE".into(), Arc::new(ZarrTableFactory {}));

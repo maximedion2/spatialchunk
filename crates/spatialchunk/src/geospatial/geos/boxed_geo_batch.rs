@@ -128,7 +128,7 @@ impl BBoxedGeoBatch {
 }
 
 // Expands a rect by `buffer` on all four sides.
-fn inflate(rect: Rect<f32>, buffer: f64) -> Rect<f32> {
+pub(crate) fn inflate(rect: Rect<f32>, buffer: f64) -> Rect<f32> {
     let b = buffer as f32;
     Rect::new(
         Coord {
@@ -146,7 +146,7 @@ fn inflate(rect: Rect<f32>, buffer: f64) -> Rect<f32> {
 // the geometries are parsed, but we only parse a geometry after we've determined
 // it matches another geo on the probe side based on its bounding box, so we need
 // the bbox first.
-fn bbox_of(wkb: &Wkb) -> Option<Rect<f32>> {
+pub(crate) fn bbox_of(wkb: &Wkb) -> Option<Rect<f32>> {
     let mut min_x = f32::INFINITY;
     let mut min_y = f32::INFINITY;
     let mut max_x = f32::NEG_INFINITY;

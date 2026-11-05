@@ -248,7 +248,7 @@ fn match_relation_predicate(
 
 // Extracts a constant f64 from a literal argument. Returns None for a
 // non-literal or non-numeric arg.
-fn literal_f64(expr: &Arc<dyn PhysicalExpr>) -> Option<f64> {
+pub(crate) fn literal_f64(expr: &Arc<dyn PhysicalExpr>) -> Option<f64> {
     let value = expr.downcast_ref::<Literal>()?.value();
     match value.cast_to(&DataType::Float64).ok()? {
         ScalarValue::Float64(Some(v)) => Some(v),
