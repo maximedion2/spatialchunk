@@ -33,6 +33,7 @@ futures-util = { version = "0.3.31" }
 geo-index = "0.3"
 geo-traits = {version = "0.3.0" }
 geo-types = { version = "0.7.18" }
+i_overlay = { version = "9.1.0" }
 itertools = { version = "0.14.0" }
 ndarray = { version = "0.17.1" }
 object_store = { version = "0.13.2" }

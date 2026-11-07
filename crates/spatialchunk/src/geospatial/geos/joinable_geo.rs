@@ -85,6 +85,10 @@ impl Point {
         self.x
     }
 
+    pub(crate) fn y(&self) -> f64 {
+        self.y
+    }
+
     pub(crate) fn is_equal(&self, other: &Point) -> bool {
         self.x == other.x && self.y == other.y
     }
@@ -497,6 +501,11 @@ pub(crate) enum JoinableGeo {
     },
     Line {
         lines: Vec<LineSegment>,
+
+        // Index in `lines` of each linestring's first segment (segments of a
+        // linestring are contiguous). Needed to tell disconnected linestrings
+        // apart, since consecutive ones may share an endpoint.
+        line_starts: Vec<usize>,
         index: NaturalIndex,
     },
     Poly {
@@ -553,8 +562,10 @@ fn build_line_geo<LS: LineStringTrait<T = f64>>(
     linestrings: impl Iterator<Item = LS>,
 ) -> Result<JoinableGeo, GeoError> {
     let mut lines: Vec<LineSegment> = Vec::new();
+    let mut line_starts: Vec<usize> = Vec::new();
 
     for ls in linestrings {
+        line_starts.push(lines.len());
         // Boundary flags are dummies here — the real mod-2 values are
         // computed by the self-join below.
         for (c1, c2) in ls
@@ -597,7 +608,11 @@ fn build_line_geo<LS: LineStringTrait<T = f64>>(
         seg.p2_boundary = flags[2 * i + 1];
     }
 
-    Ok(JoinableGeo::Line { lines, index })
+    Ok(JoinableGeo::Line {
+        lines,
+        line_starts,
+        index,
+    })
 }
 
 // Accumulator for the construction-time endpoint self-join that computes
@@ -1055,7 +1070,7 @@ impl JoinableGeo {
     fn bounding_box(&self) -> Option<IndexBox> {
         match self {
             JoinableGeo::Point { index, .. } => index.boxes.last().copied(),
-            JoinableGeo::Line { lines, index } => index
+            JoinableGeo::Line { lines, index, .. } => index
                 .boxes
                 .last()
                 .copied()
@@ -1106,6 +1121,54 @@ impl JoinableGeo {
                 edges, holes_index, ..
             } => single_into(&edges[holes_index.geo_id_offset..], other, acc),
             _ => unreachable!("fold_holes_into is poly-only"),
+        }
+    }
+
+    // Dumps the geometry as a list of vertex paths:
+    // - Point: one single-vertex path per point.
+    // - Line: one open path per linestring.
+    // - Poly: one open ring per shell/hole (first vertex not repeated), oriented
+    //   with the interior on the left, so shells are CCW and holes CW. Ring
+    //   roles are carried by orientation alone, so all rings of all polys are
+    //   flattened into one list.
+    pub(crate) fn dump_paths(&self) -> Vec<Vec<[f64; 2]>> {
+        match self {
+            JoinableGeo::Point { points, .. } => points.iter().map(|p| vec![[p.x, p.y]]).collect(),
+            JoinableGeo::Line {
+                lines, line_starts, ..
+            } => line_starts
+                .iter()
+                .enumerate()
+                .map(|(k, &start)| {
+                    let end = line_starts.get(k + 1).copied().unwrap_or(lines.len());
+                    let segs = &lines[start..end];
+                    let mut path: Vec<[f64; 2]> = segs.iter().map(|s| [s.p1.x, s.p1.y]).collect();
+                    if let Some(last) = segs.last() {
+                        path.push([last.p2.x, last.p2.y]);
+                    }
+                    path
+                })
+                .collect(),
+            JoinableGeo::Poly { edges, .. } => {
+                let mut rings = Vec::new();
+                let mut start = 0;
+                while start < edges.len() {
+                    // Rings are contiguous; advance to the ring's last edge,
+                    // the one whose `next` wraps back to the ring's first edge.
+                    let mut end = start;
+                    while edges[end].next == end + 1 {
+                        end += 1;
+                    }
+                    let mut ring: Vec<[f64; 2]> =
+                        edges[start..=end].iter().map(|e| [e.p1.x, e.p1.y]).collect();
+                    if !edges[start].interior_on_left {
+                        ring.reverse();
+                    }
+                    rings.push(ring);
+                    start = end + 1;
+                }
+                rings
+            }
         }
     }
 }
