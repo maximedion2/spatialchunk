@@ -1159,8 +1159,10 @@ impl JoinableGeo {
                     while edges[end].next == end + 1 {
                         end += 1;
                     }
-                    let mut ring: Vec<[f64; 2]> =
-                        edges[start..=end].iter().map(|e| [e.p1.x, e.p1.y]).collect();
+                    let mut ring: Vec<[f64; 2]> = edges[start..=end]
+                        .iter()
+                        .map(|e| [e.p1.x, e.p1.y])
+                        .collect();
                     if !edges[start].interior_on_left {
                         ring.reverse();
                     }
