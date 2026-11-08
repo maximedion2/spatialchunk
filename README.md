@@ -47,15 +47,16 @@ See full example [here](crates/spatialchunk/examples/overture_era5_join.rs)
 - [ ] Spatial join logic and udfs for less common predicates
 - [x] ST_Area, ST_Distance
 - [x] ST_Point
-- [ ] ST_Buffer
-- [ ] ST_Intersections
+- [x] ST_Buffer
+- [ ] ST_Intersection
 - [ ] K_Nearest
 - [x] WKB and WKT support
 - [x] Optimizer logic to to convert NJLs to properly optimized spatial joins
 - [ ] Geoparquet 1.1 native GeoArrow encoding support
 - [x] Spatial join pushdown to geoparquet files
 - [ ] Disk dumps when running out of ram
-- [ ] Support for partially materializing the build side 
+- [ ] Support for partially materializing the build side
+- [ ] Support CRS and Geography
 
 ### Chunks + geospatial
 - [x] Spatial join pushdown against zarr/icechunk (only ST_Point for zarr/icecehunk)

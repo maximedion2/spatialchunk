@@ -12,6 +12,7 @@
 
 pub mod spatial_predicate_udfs;
 pub mod st_area;
+pub mod st_buffer;
 pub mod st_distance;
 pub mod st_geomfrom;
 pub mod st_point;
@@ -21,6 +22,7 @@ pub use spatial_predicate_udfs::{
     StWithinUdf,
 };
 pub use st_area::StAreaUdf;
+pub use st_buffer::StBufferUdf;
 pub use st_distance::StDistanceUdf;
 pub use st_geomfrom::{StGeomFromWkbUdf, StGeomFromWktUdf};
 pub use st_point::StPointUdf;

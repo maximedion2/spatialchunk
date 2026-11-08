@@ -29,9 +29,9 @@ mod session {
 
     use crate::geospatial::file_source::geoparquet_file_source::GeoParquetFormatFactory;
     use crate::geospatial::{
-        SpatialJoinPhysicalOptimizer, StAreaUdf, StContainsUdf, StCoveredByUdf, StCoversUdf,
-        StDWithinUdf, StDistanceUdf, StGeomFromWkbUdf, StGeomFromWktUdf, StIntersectsUdf,
-        StPointUdf, StTouchesUdf, StWithinUdf,
+        SpatialJoinPhysicalOptimizer, StAreaUdf, StBufferUdf, StContainsUdf, StCoveredByUdf,
+        StCoversUdf, StDWithinUdf, StDistanceUdf, StGeomFromWkbUdf, StGeomFromWktUdf,
+        StIntersectsUdf, StPointUdf, StTouchesUdf, StWithinUdf,
     };
     use crate::table::ZarrTableFactory;
 
@@ -73,6 +73,7 @@ mod session {
 
         let ctx = SessionContext::new_with_state(state);
         ctx.register_udf(ScalarUDF::from(StAreaUdf::default()));
+        ctx.register_udf(ScalarUDF::from(StBufferUdf::default()));
         ctx.register_udf(ScalarUDF::from(StContainsUdf::default()));
         ctx.register_udf(ScalarUDF::from(StCoveredByUdf::default()));
         ctx.register_udf(ScalarUDF::from(StCoversUdf::default()));
