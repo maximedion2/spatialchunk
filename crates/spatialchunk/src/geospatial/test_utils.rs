@@ -32,6 +32,7 @@ use datafusion::physical_plan::joins::utils::{ColumnIndex, JoinFilter};
 use datafusion::physical_plan::{PhysicalExpr, RecordBatchStream, SendableRecordBatchStream};
 use futures::Stream;
 use geo_types::Geometry;
+use geos::Geom;
 use parquet::arrow::arrow_writer::ArrowWriterOptions;
 use parquet::arrow::ArrowWriter;
 use parquet::file::metadata::KeyValue;
@@ -42,7 +43,9 @@ use wkb::writer::{
 };
 use wkt::TryFromWkt;
 
-use crate::geospatial::udfs::st_geomfrom::{ARROW_EXTENSION_NAME_KEY, GEOARROW_WKB_EXTENSION_NAME};
+use crate::geospatial::udfs::udf_helpers::{
+    geometry_field, GeoMetadata, ARROW_EXTENSION_NAME_KEY, GEOARROW_WKB_EXTENSION_NAME,
+};
 
 pub(crate) fn wkt_to_wkb(wkt_str: &str) -> Vec<u8> {
     let geom = Geometry::<f64>::try_from_wkt_str(wkt_str).unwrap();
@@ -58,6 +61,14 @@ pub(crate) fn wkt_to_wkb(wkt_str: &str) -> Vec<u8> {
         _ => panic!("unsupported geometry: {wkt_str}"),
     }
     buf
+}
+
+// The area of the intersection over the area of the union, 1 for identical
+// geometries.
+pub(crate) fn iou(a: &geos::Geometry, b: &geos::Geometry) -> f64 {
+    let inter = a.intersection(b).unwrap().area().unwrap();
+    let union = a.union(b).unwrap().area().unwrap();
+    inter / union
 }
 
 /// Builds unit squares from bottom-left corners. `None` produces an empty polygon.
@@ -100,7 +111,14 @@ pub(crate) fn make_geo_stream(
     value_column_name: &str,
 ) -> SendableRecordBatchStream {
     let schema = Arc::new(Schema::new(vec![
-        Field::new(geo_column_name, DataType::Binary, false),
+        geometry_field(
+            geo_column_name,
+            DataType::Binary,
+            false,
+            &GeoMetadata::default(),
+        )
+        .as_ref()
+        .clone(),
         Field::new(value_column_name, DataType::Int32, false),
     ]));
 

@@ -534,6 +534,7 @@ mod zarr_stream_tests {
     use super::*;
     use crate::geospatial::geos::indexed_build_side::test_helpers::make_indexed_build_side;
     use crate::geospatial::udfs::st_point::StPointUdf;
+    use crate::geospatial::udfs::udf_helpers::{geometry_field, GeoMetadata};
     use crate::test_utils::{
         extract_col, get_local_zarr_store, get_local_zarr_store_3d, get_local_zarr_store_4d,
         get_local_zarr_store_cf_times, get_local_zarr_store_mix_dims,
@@ -651,7 +652,7 @@ mod zarr_stream_tests {
                 Arc::new(Column::new("lon", 2)),
                 Arc::new(Column::new("lat", 1)),
             ],
-            Arc::new(Field::new("geometry", DataType::Binary, true)),
+            geometry_field("geometry", DataType::Binary, true, &GeoMetadata::default()),
             Arc::new(ConfigOptions::default()),
         ));
 

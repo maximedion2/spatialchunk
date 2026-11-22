@@ -10,81 +10,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::st_within::{
-    HolesInLeftPoly, LineInLine, LineInPoly, PointInLine, PointInPoint, PointInPoly, PolyInPoly,
-};
-use crate::geospatial::geos::{Accumulator, JoinableGeo};
+use super::st_within::within_impl;
+use crate::geospatial::geos::joinable_geo::{GeoKernel, JoinableGeo};
 
 // *************************************************************
 // covered_by(a, b) -> true if every point of a lies in b (interior or boundary).
 // Mirrors st_within, but left-interior contact with right's boundary qualifies
-// instead of being ignored. That only changes the outcome when dim(a) < dim(b)
-// (point×line, point×poly, line×poly); the other combinations are identical to
-// within, so the shared accumulators are reused with the boundary flag set true
-// only where it matters.
+// instead of being ignored.
 // *************************************************************
-pub(crate) fn st_covered_by(a: &JoinableGeo, b: &JoinableGeo) -> bool {
-    match (a, b) {
-        // A higher-dimensional geometry can't be covered by a lower-dimensional one.
-        (JoinableGeo::Line { .. } | JoinableGeo::Poly { .. }, JoinableGeo::Point { .. })
-        | (JoinableGeo::Poly { .. }, JoinableGeo::Line { .. }) => false,
-
-        (JoinableGeo::Point { points, .. }, JoinableGeo::Poly { edges, .. }) => {
-            let mut acc = PointInPoly::new(points, edges, true);
-            a.fold_for_grouped_check(b, &mut acc);
-            acc.finish()
-        }
-
-        (JoinableGeo::Point { points: a_pts, .. }, JoinableGeo::Point { points: b_pts, .. }) => {
-            let mut acc = PointInPoint::new(a_pts, b_pts);
-            a.fold_for_grouped_check(b, &mut acc);
-            acc.finish()
-        }
-
-        (JoinableGeo::Point { points, .. }, JoinableGeo::Line { lines, .. }) => {
-            let mut acc = PointInLine::new(points, lines, true);
-            a.fold_for_grouped_check(b, &mut acc);
-            acc.finish()
-        }
-
-        (JoinableGeo::Line { lines: l_lines, .. }, JoinableGeo::Line { lines: r_lines, .. }) => {
-            let mut acc = LineInLine::new(l_lines, r_lines);
-            a.fold_for_grouped_check(b, &mut acc);
-            acc.finish()
-        }
-
-        (JoinableGeo::Line { lines, .. }, JoinableGeo::Poly { edges, .. }) => {
-            let mut acc = LineInPoly::new(lines, edges, true);
-            a.fold_for_grouped_check(b, &mut acc);
-            acc.finish()
-        }
-
-        (
-            JoinableGeo::Poly {
-                edges: l_edges,
-                poly_ids: l_ids,
-                ..
-            },
-            JoinableGeo::Poly {
-                edges: r_edges,
-                poly_ids: r_ids,
-                ..
-            },
-        ) => {
-            let mut hole_acc = HolesInLeftPoly::new(r_edges, b.holes_start(), l_edges);
-            b.fold_holes_into(a, &mut hole_acc);
-            if hole_acc.finish() {
-                return false; // this is the case where left contains a right hole.
-            }
-            let mut acc = PolyInPoly::new(l_edges, l_ids, r_edges, r_ids);
-            a.fold_for_grouped_check(b, &mut acc);
-            acc.finish()
-        }
-    }
+pub(crate) fn st_covered_by<K: GeoKernel>(a: &JoinableGeo<K>, b: &JoinableGeo<K>) -> bool {
+    within_impl(a, b, true)
 }
 
 // st_covers is forwarded to st_covered_by with swapped arguments.
-pub(crate) fn st_covers(a: &JoinableGeo, b: &JoinableGeo) -> bool {
+pub(crate) fn st_covers<K: GeoKernel>(a: &JoinableGeo<K>, b: &JoinableGeo<K>) -> bool {
     st_covered_by(b, a)
 }
 
@@ -92,8 +31,8 @@ pub(crate) fn st_covers(a: &JoinableGeo, b: &JoinableGeo) -> bool {
 mod test_helpers {
     use geos::Geom;
 
-    use super::JoinableGeo;
-    use crate::geospatial::join_predicates::{st_covered_by, st_covers};
+    use super::{st_covered_by, st_covers};
+    use crate::geospatial::geos::joinable_geo::{JoinableGeo, Planar, Spherical};
     pub(super) use crate::geospatial::test_utils::wkt_to_wkb;
 
     pub(super) fn compare_covered_by(label: &str, wkt_a: &str, wkt_b: &str) {
@@ -104,8 +43,8 @@ mod test_helpers {
         let geos_b = geos::Geometry::new_from_wkb(&bytes_b).unwrap();
         let mut geos_result = geos_a.covered_by(&geos_b).unwrap();
 
-        let joinable_a = JoinableGeo::from_wkb(&bytes_a).unwrap();
-        let joinable_b = JoinableGeo::from_wkb(&bytes_b).unwrap();
+        let joinable_a = JoinableGeo::<Planar>::from_wkb(&bytes_a).unwrap();
+        let joinable_b = JoinableGeo::<Planar>::from_wkb(&bytes_b).unwrap();
         let mut joinable_result = st_covered_by(&joinable_a, &joinable_b);
 
         assert_eq!(geos_result, joinable_result, "{label}");
@@ -114,6 +53,71 @@ mod test_helpers {
         joinable_result = st_covers(&joinable_b, &joinable_a);
 
         assert_eq!(geos_result, joinable_result, "{label}, st_covers version");
+    }
+
+    // No oracle for geographies, so the expected result is given.
+    pub(super) fn check_geography_covered_by(
+        label: &str,
+        wkt_a: &str,
+        wkt_b: &str,
+        expected: bool,
+    ) {
+        let joinable_a = JoinableGeo::<Spherical>::from_wkb(&wkt_to_wkb(wkt_a)).unwrap();
+        let joinable_b = JoinableGeo::<Spherical>::from_wkb(&wkt_to_wkb(wkt_b)).unwrap();
+
+        assert_eq!(expected, st_covered_by(&joinable_a, &joinable_b), "{label}");
+        assert_eq!(
+            expected,
+            st_covers(&joinable_b, &joinable_a),
+            "{label}, st_covers version"
+        );
+    }
+}
+
+#[cfg(test)]
+mod geography_covered_by_tests {
+    use super::test_helpers::check_geography_covered_by;
+
+    // Points and lines on the boundary, along the equator and meridians, the only
+    // great circles whose points are exact in lon/lat. square's bottom edge is
+    // along the equator and its sides along meridians, while its top edge from
+    // (10 10) to (0 10) bulges north of latitude 10, so a line along latitude 10
+    // under it is inside, not on it.
+    #[test]
+    fn on_boundary() {
+        let equator_line = "LINESTRING (0 0, 10 0)";
+        let square = "POLYGON ((0 0, 10 0, 10 10, 0 10, 0 0))";
+
+        check_geography_covered_by("point on line", "POINT (5 0)", equator_line, true);
+        check_geography_covered_by("point on line endpoint", "POINT (0 0)", equator_line, true);
+        check_geography_covered_by("point next to line", "POINT (5 0.1)", equator_line, false);
+
+        check_geography_covered_by("point on equator edge", "POINT (5 0)", square, true);
+        check_geography_covered_by("point on meridian edge", "POINT (10 5)", square, true);
+        check_geography_covered_by(
+            "line on equator edge",
+            "LINESTRING (2 0, 8 0)",
+            square,
+            true,
+        );
+        check_geography_covered_by(
+            "line on meridian edge",
+            "LINESTRING (10 2, 10 8)",
+            square,
+            true,
+        );
+        check_geography_covered_by(
+            "line along the equator past the edge",
+            "LINESTRING (2 0, 12 0)",
+            square,
+            false,
+        );
+        check_geography_covered_by(
+            "line along latitude 10, under the top edge",
+            "LINESTRING (2 10, 8 10)",
+            square,
+            true,
+        );
     }
 }
 

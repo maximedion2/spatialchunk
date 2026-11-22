@@ -10,59 +10,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::compute::cast;
 use arrow_array::builder::BinaryBuilder;
 use arrow_array::Array;
-use arrow_schema::{DataType, Field, FieldRef};
+use arrow_schema::{DataType, FieldRef};
 use datafusion::common::cast::as_large_string_array;
-use datafusion::common::{exec_datafusion_err, plan_err, Result};
+use datafusion::common::{exec_datafusion_err, Result};
 use datafusion::logical_expr::{
-    ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl, Signature, TypeSignature,
-    Volatility,
+    ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl, Signature,
 };
 use geo_types::Geometry;
 use wkb::writer::{write_geometry, WriteOptions};
 use wkt::TryFromWkt;
 
-/// The Arrow field-metadata key for an extension type's name.
-pub(crate) const ARROW_EXTENSION_NAME_KEY: &str = "ARROW:extension:name";
+use super::udf_helpers::{crs_argument, geometry_field, signature_with_optional_crs, GeoMetadata};
 
-/// The GeoArrow extension name that marks a binary column as WKB geometry. A
-/// column carrying this on its field metadata is treated as geometry; a bare
-/// binary column is not.
-pub(crate) const GEOARROW_WKB_EXTENSION_NAME: &str = "geoarrow.wkb";
-
-/// Builds an output `Field` for a geometry column: the given storage type tagged
-/// with the `geoarrow.wkb` extension name so downstream operations recognize it.
-pub(crate) fn geometry_field(name: &str, storage_type: DataType, nullable: bool) -> FieldRef {
-    let mut metadata = HashMap::new();
-    metadata.insert(
-        ARROW_EXTENSION_NAME_KEY.to_string(),
-        GEOARROW_WKB_EXTENSION_NAME.to_string(),
-    );
-    Arc::new(Field::new(name, storage_type, nullable).with_metadata(metadata))
-}
-
-/// Errors unless `field` is tagged as WKB geometry (the `geoarrow.wkb` extension
-/// name). Used to reject bare binary columns from geometry UDFs and the spatial
-/// join, forcing an explicit `st_geomfromwkb` / `st_geomfromwkt` tag first.
-pub(crate) fn require_geometry(field: &Field) -> Result<()> {
-    match field.metadata().get(ARROW_EXTENSION_NAME_KEY) {
-        Some(name) if name == GEOARROW_WKB_EXTENSION_NAME => Ok(()),
-        _ => plan_err!(
-            "expected a geometry column tagged '{GEOARROW_WKB_EXTENSION_NAME}' \
-             (use st_geomfromwkb / st_geomfromwkt), got a plain {} column",
-            field.data_type()
-        ),
-    }
-}
-
-/// `st_geomfromwkb(geom)` stamps an already-WKB binary column as geometry. The
-/// bytes are passed through unchanged; only the output field is tagged with the
-/// `geoarrow.wkb` extension name.
+/// `st_geomfromwkb(geom [, crs])` stamps an already-WKB binary column as
+/// geometry. The bytes are passed through unchanged; only the output field is
+/// tagged with the `geoarrow.wkb` extension name, and the crs if given.
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct StGeomFromWkbUdf {
     signature: Signature,
@@ -71,13 +38,10 @@ pub struct StGeomFromWkbUdf {
 impl Default for StGeomFromWkbUdf {
     fn default() -> Self {
         Self {
-            signature: Signature::one_of(
-                vec![
-                    TypeSignature::Exact(vec![DataType::Binary]),
-                    TypeSignature::Exact(vec![DataType::BinaryView]),
-                ],
-                Volatility::Immutable,
-            ),
+            signature: signature_with_optional_crs(vec![
+                vec![DataType::Binary],
+                vec![DataType::BinaryView],
+            ]),
         }
     }
 }
@@ -98,11 +62,13 @@ impl ScalarUDFImpl for StGeomFromWkbUdf {
     // Tag the output field with the geoarrow.wkb extension name, preserving the
     // input's storage type (Binary or BinaryView).
     fn return_field_from_args(&self, args: ReturnFieldArgs) -> Result<FieldRef> {
+        let crs = crs_argument(self.name(), &args, 1)?;
         let input = &args.arg_fields[0];
         Ok(geometry_field(
             input.name(),
             input.data_type().clone(),
             input.is_nullable(),
+            &GeoMetadata::with_crs(crs),
         ))
     }
 
@@ -112,8 +78,9 @@ impl ScalarUDFImpl for StGeomFromWkbUdf {
     }
 }
 
-/// `st_geomfromwkt(text)` parses a WKT string column into WKB, returning a binary
-/// column tagged with the `geoarrow.wkb` extension name.
+/// `st_geomfromwkt(text [, crs])` parses a WKT string column into WKB, returning
+/// a binary column tagged with the `geoarrow.wkb` extension name, and the crs if
+/// given.
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct StGeomFromWktUdf {
     signature: Signature,
@@ -122,14 +89,11 @@ pub struct StGeomFromWktUdf {
 impl Default for StGeomFromWktUdf {
     fn default() -> Self {
         Self {
-            signature: Signature::one_of(
-                vec![
-                    TypeSignature::Exact(vec![DataType::Utf8]),
-                    TypeSignature::Exact(vec![DataType::LargeUtf8]),
-                    TypeSignature::Exact(vec![DataType::Utf8View]),
-                ],
-                Volatility::Immutable,
-            ),
+            signature: signature_with_optional_crs(vec![
+                vec![DataType::Utf8],
+                vec![DataType::LargeUtf8],
+                vec![DataType::Utf8View],
+            ]),
         }
     }
 }
@@ -148,10 +112,12 @@ impl ScalarUDFImpl for StGeomFromWktUdf {
     }
 
     fn return_field_from_args(&self, args: ReturnFieldArgs) -> Result<FieldRef> {
+        let crs = crs_argument(self.name(), &args, 1)?;
         Ok(geometry_field(
             args.arg_fields[0].name(),
             DataType::Binary,
             args.arg_fields[0].is_nullable(),
+            &GeoMetadata::with_crs(crs),
         ))
     }
 
@@ -187,11 +153,13 @@ impl ScalarUDFImpl for StGeomFromWktUdf {
 #[cfg(test)]
 mod geomfrom_tests {
     use arrow_array::{ArrayRef, BinaryArray, StringArray};
+    use arrow_schema::Field;
     use datafusion::config::ConfigOptions;
     use geos::Geom;
 
     use super::*;
     use crate::geospatial::test_utils::wkt_to_wkb;
+    use crate::geospatial::udfs::udf_helpers::GEOARROW_WKB_EXTENSION_NAME;
 
     const POLYS: [&str; 2] = [
         "POLYGON ((0 0, 2 0, 2 2, 0 2, 0 0))",

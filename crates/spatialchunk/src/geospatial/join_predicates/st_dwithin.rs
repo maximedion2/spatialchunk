@@ -10,23 +10,31 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::marker::PhantomData;
+
 use super::st_intersects::st_intersects;
-use crate::geospatial::geos::{Accumulator, Bboxable, JoinableGeo, Point, SegmentTrait};
+use crate::geospatial::geos::joinable_geo::{
+    Accumulator, Bboxable, GeoKernel, JoinableGeo, Segment,
+};
 
 // *************************************************************
 // dwithin(a, b, distance) -> true if the minimum distance between a
 // and b is <= distance.
 // *************************************************************
-pub(crate) fn st_dwithin(a: &JoinableGeo, b: &JoinableGeo, distance: f64) -> bool {
+pub(crate) fn st_dwithin<K: GeoKernel>(
+    a: &JoinableGeo<K>,
+    b: &JoinableGeo<K>,
+    distance: f64,
+) -> bool {
     match (a, b) {
         (JoinableGeo::Point { points: a_pts, .. }, JoinableGeo::Point { points: b_pts, .. }) => {
-            let mut acc = PointToPointDist::new(a_pts, b_pts, distance);
+            let mut acc = PointToPointDist::<K>::new(a_pts, b_pts, distance);
             a.fold_for_unordered_check(b, &mut acc);
             acc.finish()
         }
 
         (JoinableGeo::Point { points, .. }, JoinableGeo::Line { lines, .. }) => {
-            let mut acc = PointToSegmentsDist::new(points, lines, distance);
+            let mut acc = PointToSegmentsDist::<K, _>::new(points, lines, distance);
             a.fold_for_unordered_check(b, &mut acc);
             acc.finish()
         }
@@ -38,7 +46,7 @@ pub(crate) fn st_dwithin(a: &JoinableGeo, b: &JoinableGeo, distance: f64) -> boo
             if distance >= 0.0 && a.top_bbox_overlaps(b) && st_intersects(a, b) {
                 return true;
             }
-            let mut acc = PointToSegmentsDist::new(points, edges, distance);
+            let mut acc = PointToSegmentsDist::<K, _>::new(points, edges, distance);
             a.fold_for_unordered_check(b, &mut acc);
             acc.finish()
         }
@@ -50,7 +58,7 @@ pub(crate) fn st_dwithin(a: &JoinableGeo, b: &JoinableGeo, distance: f64) -> boo
             if distance >= 0.0 && a.top_bbox_overlaps(b) && st_intersects(a, b) {
                 return true;
             }
-            let mut acc = SegmentsToSegmentsDist::new(l_lines, r_lines, distance);
+            let mut acc = SegmentsToSegmentsDist::<K, _, _>::new(l_lines, r_lines, distance);
             a.fold_for_unordered_check(b, &mut acc);
             acc.finish()
         }
@@ -62,7 +70,7 @@ pub(crate) fn st_dwithin(a: &JoinableGeo, b: &JoinableGeo, distance: f64) -> boo
             if distance >= 0.0 && a.top_bbox_overlaps(b) && st_intersects(a, b) {
                 return true;
             }
-            let mut acc = SegmentsToSegmentsDist::new(lines, edges, distance);
+            let mut acc = SegmentsToSegmentsDist::<K, _, _>::new(lines, edges, distance);
             a.fold_for_unordered_check(b, &mut acc);
             acc.finish()
         }
@@ -74,7 +82,7 @@ pub(crate) fn st_dwithin(a: &JoinableGeo, b: &JoinableGeo, distance: f64) -> boo
             if distance >= 0.0 && a.top_bbox_overlaps(b) && st_intersects(a, b) {
                 return true;
             }
-            let mut acc = SegmentsToSegmentsDist::new(a_edges, b_edges, distance);
+            let mut acc = SegmentsToSegmentsDist::<K, _, _>::new(a_edges, b_edges, distance);
             a.fold_for_unordered_check(b, &mut acc);
             acc.finish()
         }
@@ -86,42 +94,45 @@ pub(crate) fn st_dwithin(a: &JoinableGeo, b: &JoinableGeo, distance: f64) -> boo
     }
 }
 
-// Squares a distance threshold for comparison against squared distances. A
-// negative threshold can never be satisfied, so it maps to -inf.
-fn threshold_sq(distance: f64) -> f64 {
+// Converts a distance threshold to the kernel's internal squared measure, which the
+// distances are compared in. A negative threshold can never be satisfied, so it
+// maps to -inf.
+fn threshold_sq<K: GeoKernel>(distance: f64) -> f64 {
     if distance < 0.0 {
         f64::NEG_INFINITY
     } else {
-        distance * distance
+        K::to_internal_dist_sq(distance)
     }
 }
 
-pub(crate) struct PointToPointDist<'a> {
-    left: &'a [Point],
-    right: &'a [Point],
+pub(crate) struct PointToPointDist<'a, K: GeoKernel> {
+    left: &'a [K::Point],
+    right: &'a [K::Point],
     threshold_sq: f64,
     min_dist_sq: f64,
 }
 
-impl<'a> PointToPointDist<'a> {
-    pub(crate) fn new(left: &'a [Point], right: &'a [Point], distance: f64) -> Self {
+impl<'a, K: GeoKernel> PointToPointDist<'a, K> {
+    pub(crate) fn new(left: &'a [K::Point], right: &'a [K::Point], distance: f64) -> Self {
         PointToPointDist {
             left,
             right,
-            threshold_sq: threshold_sq(distance),
+            threshold_sq: threshold_sq::<K>(distance),
             min_dist_sq: f64::INFINITY,
         }
     }
 }
 
-impl Accumulator for PointToPointDist<'_> {
+impl<K: GeoKernel> Accumulator for PointToPointDist<'_, K> {
+    type K = K;
+
     // Points carry no meaningful box for a distance prune, so consider every pair.
     fn prune(&self, _a: &impl Bboxable, _b: &impl Bboxable) -> bool {
         true
     }
 
     fn update(&mut self, li: usize, ri: usize) {
-        let d = self.left[li].dist_sq(&self.right[ri]);
+        let d = K::dist_sq(&self.left[li], &self.right[ri]);
         if d < self.min_dist_sq {
             self.min_dist_sq = d;
         }
@@ -139,31 +150,33 @@ impl Accumulator for PointToPointDist<'_> {
 // The point-to-segment distance captures the distance-zero (point on
 // a segment) case. A point inside a polygon is handled separately by
 // the caller.
-pub(crate) struct PointToSegmentsDist<'a, S> {
-    points: &'a [Point],
+pub(crate) struct PointToSegmentsDist<'a, K: GeoKernel, S> {
+    points: &'a [K::Point],
     segs: &'a [S],
     threshold_sq: f64,
     min_dist_sq: f64,
 }
 
-impl<'a, S> PointToSegmentsDist<'a, S> {
-    pub(crate) fn new(points: &'a [Point], segs: &'a [S], distance: f64) -> Self {
+impl<'a, K: GeoKernel, S> PointToSegmentsDist<'a, K, S> {
+    pub(crate) fn new(points: &'a [K::Point], segs: &'a [S], distance: f64) -> Self {
         PointToSegmentsDist {
             points,
             segs,
-            threshold_sq: threshold_sq(distance),
+            threshold_sq: threshold_sq::<K>(distance),
             min_dist_sq: f64::INFINITY,
         }
     }
 }
 
-impl<S: SegmentTrait> Accumulator for PointToSegmentsDist<'_, S> {
+impl<K: GeoKernel, S: Segment<P = K::Point>> Accumulator for PointToSegmentsDist<'_, K, S> {
+    type K = K;
+
     fn prune(&self, a: &impl Bboxable, b: &impl Bboxable) -> bool {
-        a.box_min_dist_sq(b) <= self.threshold_sq
+        K::box_min_dist_sq(&a.bbox(), &b.bbox()) <= self.threshold_sq
     }
 
     fn update(&mut self, li: usize, ri: usize) {
-        let d = self.points[li].dist_sq_to_segment(&self.segs[ri]);
+        let d = K::dist_sq_to_segment(&self.points[li], &self.segs[ri]);
         if d < self.min_dist_sq {
             self.min_dist_sq = d;
         }
@@ -180,31 +193,37 @@ impl<S: SegmentTrait> Accumulator for PointToSegmentsDist<'_, S> {
 
 // Uses `dist_sq_to_disjoint`, which assumes the pair does not cross,
 // the caller only reaches this after establishing non-intersection.
-pub(crate) struct SegmentsToSegmentsDist<'a, L, R> {
+pub(crate) struct SegmentsToSegmentsDist<'a, K: GeoKernel, L, R> {
     left: &'a [L],
     right: &'a [R],
     threshold_sq: f64,
     min_dist_sq: f64,
+    kernel: PhantomData<K>,
 }
 
-impl<'a, L, R> SegmentsToSegmentsDist<'a, L, R> {
+impl<'a, K: GeoKernel, L, R> SegmentsToSegmentsDist<'a, K, L, R> {
     pub(crate) fn new(left: &'a [L], right: &'a [R], distance: f64) -> Self {
         SegmentsToSegmentsDist {
             left,
             right,
-            threshold_sq: threshold_sq(distance),
+            threshold_sq: threshold_sq::<K>(distance),
             min_dist_sq: f64::INFINITY,
+            kernel: PhantomData,
         }
     }
 }
 
-impl<L: SegmentTrait, R: SegmentTrait> Accumulator for SegmentsToSegmentsDist<'_, L, R> {
+impl<K: GeoKernel, L: Segment<P = K::Point>, R: Segment<P = K::Point>> Accumulator
+    for SegmentsToSegmentsDist<'_, K, L, R>
+{
+    type K = K;
+
     fn prune(&self, a: &impl Bboxable, b: &impl Bboxable) -> bool {
-        a.box_min_dist_sq(b) <= self.threshold_sq
+        K::box_min_dist_sq(&a.bbox(), &b.bbox()) <= self.threshold_sq
     }
 
     fn update(&mut self, li: usize, ri: usize) {
-        let d = self.left[li].dist_sq_to_disjoint(&self.right[ri]);
+        let d = K::dist_sq_to_disjoint(&self.left[li], &self.right[ri]);
         if d < self.min_dist_sq {
             self.min_dist_sq = d;
         }
@@ -223,8 +242,8 @@ impl<L: SegmentTrait, R: SegmentTrait> Accumulator for SegmentsToSegmentsDist<'_
 mod test_helpers {
     use geos::Geom;
 
-    use super::JoinableGeo;
-    use crate::geospatial::join_predicates::st_dwithin;
+    use super::st_dwithin;
+    use crate::geospatial::geos::joinable_geo::{JoinableGeo, Planar, Spherical};
     pub(super) use crate::geospatial::test_utils::wkt_to_wkb;
 
     // Checks st_dwithin against GEOS (min distance <= threshold), both operand
@@ -237,8 +256,8 @@ mod test_helpers {
         let geos_b = geos::Geometry::new_from_wkb(&bytes_b).unwrap();
         let geos_result = geos_a.distance(&geos_b).unwrap() <= distance;
 
-        let joinable_a = JoinableGeo::from_wkb(&bytes_a).unwrap();
-        let joinable_b = JoinableGeo::from_wkb(&bytes_b).unwrap();
+        let joinable_a = JoinableGeo::<Planar>::from_wkb(&bytes_a).unwrap();
+        let joinable_b = JoinableGeo::<Planar>::from_wkb(&bytes_b).unwrap();
 
         assert_eq!(
             geos_result,
@@ -249,6 +268,119 @@ mod test_helpers {
             geos_result,
             st_dwithin(&joinable_b, &joinable_a, distance),
             "{label}, reversed"
+        );
+    }
+
+    // No oracle for geographies, so the expected result is given. distance is in
+    // meters.
+    pub(super) fn check_geography_dwithin(
+        label: &str,
+        wkt_a: &str,
+        wkt_b: &str,
+        distance: f64,
+        expected: bool,
+    ) {
+        let joinable_a = JoinableGeo::<Spherical>::from_wkb(&wkt_to_wkb(wkt_a)).unwrap();
+        let joinable_b = JoinableGeo::<Spherical>::from_wkb(&wkt_to_wkb(wkt_b)).unwrap();
+
+        assert_eq!(
+            expected,
+            st_dwithin(&joinable_a, &joinable_b, distance),
+            "{label}"
+        );
+        assert_eq!(
+            expected,
+            st_dwithin(&joinable_b, &joinable_a, distance),
+            "{label}, reversed"
+        );
+    }
+}
+
+#[cfg(test)]
+mod geography_dwithin_tests {
+    use super::test_helpers::check_geography_dwithin;
+
+    // square's right side is along the meridian 10 and next_square's left side
+    // along the meridian 11, so they're closest at their southern end, latitude 2,
+    // where a degree of longitude is about 111 km.
+    #[test]
+    fn poly_poly() {
+        let square = "POLYGON ((0 0, 10 0, 10 10, 0 10, 0 0))";
+        let square_inside = "POLYGON ((2 2, 4 2, 4 4, 2 4, 2 2))";
+        let next_square = "POLYGON ((11 2, 13 2, 13 4, 11 4, 11 2))";
+
+        check_geography_dwithin("square in square, 0 m", square_inside, square, 0.0, true);
+        check_geography_dwithin(
+            "squares 1 degree apart, 200 km",
+            next_square,
+            square,
+            200_000.0,
+            true,
+        );
+        check_geography_dwithin(
+            "squares 1 degree apart, 50 km",
+            next_square,
+            square,
+            50_000.0,
+            false,
+        );
+    }
+
+    // Lines, unlike points, are pruned by the distance between their bboxes.
+    // - Across the antimeridian, 1 degree apart along the equator (111.2 km).
+    // - Across the north pole, 2 degrees apart on the meridians 0 and 180 (222.4
+    //   km), their longitudes 180 degrees apart.
+    // - A point 0.21 degrees above the peak of an edge bulging to 67.79 (23.1 km),
+    //   8 degrees above its endpoints.
+    #[test]
+    fn lon_lat_distortions() {
+        let west_of_antimeridian = "LINESTRING (178.5 0, 179.5 0)";
+        let east_of_antimeridian = "LINESTRING (-179.5 0, -178.5 0)";
+        let meridian_0 = "LINESTRING (0 88, 0 89)";
+        let meridian_180 = "LINESTRING (180 88, 180 89)";
+        let bulging_edge = "LINESTRING (0 60, 90 60)";
+
+        check_geography_dwithin(
+            "across the antimeridian, 200 km",
+            west_of_antimeridian,
+            east_of_antimeridian,
+            200_000.0,
+            true,
+        );
+        check_geography_dwithin(
+            "across the antimeridian, 50 km",
+            west_of_antimeridian,
+            east_of_antimeridian,
+            50_000.0,
+            false,
+        );
+        check_geography_dwithin(
+            "across the pole, 250 km",
+            meridian_0,
+            meridian_180,
+            250_000.0,
+            true,
+        );
+        check_geography_dwithin(
+            "across the pole, 200 km",
+            meridian_0,
+            meridian_180,
+            200_000.0,
+            false,
+        );
+        check_geography_dwithin(
+            "above the bulge, 50 km",
+            "POINT (45 68)",
+            bulging_edge,
+            50_000.0,
+            true,
+        );
+        check_geography_dwithin(
+            "above the bulge, 10 km",
+            "POINT (45 68)",
+            bulging_edge,
+            10_000.0,
+            false,
         );
     }
 }

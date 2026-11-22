@@ -15,7 +15,13 @@ pub mod st_area;
 pub mod st_buffer;
 pub mod st_distance;
 pub mod st_geomfrom;
+pub mod st_makeline;
 pub mod st_point;
+pub mod st_setcrs;
+pub mod st_shiftlongitude;
+pub mod st_togeography;
+pub mod st_transform;
+pub(crate) mod udf_helpers;
 
 pub use spatial_predicate_udfs::{
     StContainsUdf, StCoveredByUdf, StCoversUdf, StDWithinUdf, StIntersectsUdf, StTouchesUdf,
@@ -25,4 +31,9 @@ pub use st_area::StAreaUdf;
 pub use st_buffer::StBufferUdf;
 pub use st_distance::StDistanceUdf;
 pub use st_geomfrom::{StGeomFromWkbUdf, StGeomFromWktUdf};
+pub use st_makeline::StMakeLineUdf;
 pub use st_point::StPointUdf;
+pub use st_setcrs::StSetCrsUdf;
+pub use st_shiftlongitude::{ShiftLongitudeUdf, StShiftLongitudeUdf};
+pub use st_togeography::StToGeographyUdf;
+pub use st_transform::StTransformUdf;

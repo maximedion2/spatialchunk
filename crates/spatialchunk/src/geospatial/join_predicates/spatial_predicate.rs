@@ -30,6 +30,7 @@ pub struct RelationPredicate {
     pub left: Arc<dyn PhysicalExpr>,
     pub right: Arc<dyn PhysicalExpr>,
     pub relation_type: SpatialRelationType,
+    pub is_geography: bool,
 }
 
 impl SpatialRelationType {
@@ -75,7 +76,13 @@ impl RelationPredicate {
             left,
             right,
             relation_type,
+            is_geography: false,
         }
+    }
+
+    pub fn with_is_geography(mut self, is_geography: bool) -> Self {
+        self.is_geography = is_geography;
+        self
     }
 }
 

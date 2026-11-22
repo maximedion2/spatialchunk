@@ -419,6 +419,7 @@ impl ExecutionPlan for SpatialJoinExec {
                     SpatialRelationType::DWithin { distance } => Some(*distance),
                     _ => None,
                 };
+                let is_geography = self.predicate.is_geography;
 
                 let fut: BoxFuture<'static, Result<Arc<IndexedBuildSide>, Arc<DataFusionError>>> =
                     Box::pin(async move {
@@ -433,9 +434,14 @@ impl ExecutionPlan for SpatialJoinExec {
                             .collect::<Result<_, Arc<DataFusionError>>>()?;
 
                         let build_side = Arc::new(
-                            build_from_streams(streams, needs_visited, probe_partition_count)
-                                .await
-                                .map_err(Arc::new)?,
+                            build_from_streams(
+                                streams,
+                                needs_visited,
+                                probe_partition_count,
+                                is_geography,
+                            )
+                            .await
+                            .map_err(Arc::new)?,
                         );
 
                         // Now that the index exists, fill in the pushed-down
@@ -499,6 +505,7 @@ mod exec_tests {
     use super::SpatialJoinExec;
     use crate::geospatial::join_predicates::{RelationPredicate, SpatialRelationType};
     use crate::geospatial::test_utils::{col1_gte_col2_filter, wkt_to_wkb};
+    use crate::geospatial::udfs::udf_helpers::{geometry_field, GeoMetadata};
 
     // Build side: 8 unit squares, col_1 = row index.
     //   build[1] = (1,1)-(2,2)     → within probe[0]
@@ -535,21 +542,37 @@ mod exec_tests {
 
     fn build_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
-            Field::new("geometry_1", DataType::Binary, true),
+            geometry_field(
+                "geometry_1",
+                DataType::Binary,
+                true,
+                &GeoMetadata::default(),
+            )
+            .as_ref()
+            .clone(),
             Field::new("col_1", DataType::Int32, true),
         ]))
     }
 
     fn probe_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
-            Field::new("geometry_2", DataType::Binary, true),
+            geometry_field(
+                "geometry_2",
+                DataType::Binary,
+                true,
+                &GeoMetadata::default(),
+            )
+            .as_ref()
+            .clone(),
             Field::new("col_2", DataType::Int32, true),
         ]))
     }
 
     fn make_batch(wkts: &[&str], col_values: &[i32], geo_col: &str, val_col: &str) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
-            Field::new(geo_col, DataType::Binary, true),
+            geometry_field(geo_col, DataType::Binary, true, &GeoMetadata::default())
+                .as_ref()
+                .clone(),
             Field::new(val_col, DataType::Int32, true),
         ]));
         let wkbs: Vec<Vec<u8>> = wkts.iter().map(|wkt| wkt_to_wkb(wkt)).collect();

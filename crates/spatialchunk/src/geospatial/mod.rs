@@ -22,9 +22,10 @@ pub mod udfs;
 pub use spatial_join_exec::SpatialJoinExec;
 pub use spatial_join_optimizer::SpatialJoinPhysicalOptimizer;
 pub use udfs::{
-    StAreaUdf, StBufferUdf, StContainsUdf, StCoveredByUdf, StCoversUdf, StDWithinUdf,
-    StDistanceUdf, StGeomFromWkbUdf, StGeomFromWktUdf, StIntersectsUdf, StPointUdf, StTouchesUdf,
-    StWithinUdf,
+    ShiftLongitudeUdf, StAreaUdf, StBufferUdf, StContainsUdf, StCoveredByUdf, StCoversUdf,
+    StDWithinUdf, StDistanceUdf, StGeomFromWkbUdf, StGeomFromWktUdf, StIntersectsUdf,
+    StMakeLineUdf, StPointUdf, StSetCrsUdf, StShiftLongitudeUdf, StToGeographyUdf, StTouchesUdf,
+    StTransformUdf, StWithinUdf,
 };
 
 // #[cfg(test)]

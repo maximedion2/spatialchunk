@@ -29,9 +29,10 @@ mod session {
 
     use crate::geospatial::file_source::geoparquet_file_source::GeoParquetFormatFactory;
     use crate::geospatial::{
-        SpatialJoinPhysicalOptimizer, StAreaUdf, StBufferUdf, StContainsUdf, StCoveredByUdf,
-        StCoversUdf, StDWithinUdf, StDistanceUdf, StGeomFromWkbUdf, StGeomFromWktUdf,
-        StIntersectsUdf, StPointUdf, StTouchesUdf, StWithinUdf,
+        ShiftLongitudeUdf, SpatialJoinPhysicalOptimizer, StAreaUdf, StBufferUdf, StContainsUdf,
+        StCoveredByUdf, StCoversUdf, StDWithinUdf, StDistanceUdf, StGeomFromWkbUdf,
+        StGeomFromWktUdf, StIntersectsUdf, StMakeLineUdf, StPointUdf, StSetCrsUdf,
+        StShiftLongitudeUdf, StToGeographyUdf, StTouchesUdf, StTransformUdf, StWithinUdf,
     };
     use crate::table::ZarrTableFactory;
 
@@ -82,8 +83,14 @@ mod session {
         ctx.register_udf(ScalarUDF::from(StGeomFromWkbUdf::default()));
         ctx.register_udf(ScalarUDF::from(StGeomFromWktUdf::default()));
         ctx.register_udf(ScalarUDF::from(StIntersectsUdf::default()));
+        ctx.register_udf(ScalarUDF::from(StMakeLineUdf::default()));
         ctx.register_udf(ScalarUDF::from(StPointUdf::default()));
+        ctx.register_udf(ScalarUDF::from(StSetCrsUdf::default()));
+        ctx.register_udf(ScalarUDF::from(ShiftLongitudeUdf::default()));
+        ctx.register_udf(ScalarUDF::from(StShiftLongitudeUdf::default()));
+        ctx.register_udf(ScalarUDF::from(StToGeographyUdf::default()));
         ctx.register_udf(ScalarUDF::from(StTouchesUdf::default()));
+        ctx.register_udf(ScalarUDF::from(StTransformUdf::default()));
         ctx.register_udf(ScalarUDF::from(StWithinUdf::default()));
 
         Ok(ctx)

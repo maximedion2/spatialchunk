@@ -13,7 +13,6 @@
 use std::sync::Arc;
 
 use arrow::compute::cast;
-use arrow_array::builder::BinaryBuilder;
 use arrow_array::Array;
 use arrow_schema::{DataType, FieldRef};
 use datafusion::common::cast::{as_float64_array, as_int64_array, as_string_array};
@@ -29,9 +28,9 @@ use i_overlay::mesh::float::stroke::offset::StrokeOffset;
 use i_overlay::mesh::float::style::{LineCap, LineJoin, OutlineStyle, StrokeStyle};
 use wkb::writer::{write_multi_polygon, write_polygon, WriteOptions};
 
-use super::spatial_predicate_udfs::{geo_err, wkb_at};
-use super::st_geomfrom::{geometry_field, require_geometry};
-use crate::geospatial::geos::{JoinableGeo, Point};
+use super::spatial_predicate_udfs::geo_err;
+use crate::geospatial::geos::joinable_geo::{JoinableGeo, Planar};
+use crate::geospatial::geos::raw_geo::{GeoType, RawGeo};
 
 // Default number of segments per quarter circle (matches PostGIS).
 pub(crate) const DEFAULT_QUAD_SEGS: usize = 8;
@@ -191,9 +190,12 @@ pub(crate) fn st_buffer(
     style: &BufferStyle,
     buf: &mut Vec<u8>,
 ) -> Result<()> {
-    let geo = JoinableGeo::from_wkb(bytes).map_err(geo_err)?;
+    let geo = JoinableGeo::<Planar>::from_wkb(bytes).map_err(geo_err)?;
     let shapes = match &geo {
-        JoinableGeo::Point { points, .. } => buffer_points(points, radius, style),
+        JoinableGeo::Point { .. } => {
+            let centers: Vec<[f64; 2]> = geo.dump_paths().into_iter().map(|p| p[0]).collect();
+            buffer_points(&centers, radius, style)
+        }
         JoinableGeo::Line { .. } => buffer_lines(geo.dump_paths(), radius, style),
         JoinableGeo::Poly { .. } => buffer_polys(geo.dump_paths(), radius, style),
     };
@@ -207,24 +209,20 @@ pub(crate) type Shape = Vec<Vec<[f64; 2]>>;
 // A CCW ring approximating the circle of `radius` around `center`, with
 // 4 * quad_segs vertices. The ring is open (the first vertex is not
 // repeated at the end), which is what i_overlay expects as input.
-fn circle(center: &Point, radius: f64, quad_segs: usize) -> Vec<[f64; 2]> {
+fn circle([x, y]: [f64; 2], radius: f64, quad_segs: usize) -> Vec<[f64; 2]> {
     let n = 4 * quad_segs.max(1);
     let step = std::f64::consts::TAU / n as f64;
     (0..n)
         .map(|i| {
             let angle = i as f64 * step;
-            [
-                center.x() + radius * angle.cos(),
-                center.y() + radius * angle.sin(),
-            ]
+            [x + radius * angle.cos(), y + radius * angle.sin()]
         })
         .collect()
 }
 
 // A CCW axis-aligned square of half-side `radius` centered on `center`, open
 // like `circle`'s rings.
-fn square(center: &Point, radius: f64) -> Vec<[f64; 2]> {
-    let (x, y) = (center.x(), center.y());
+fn square([x, y]: [f64; 2], radius: f64) -> Vec<[f64; 2]> {
     vec![
         [x - radius, y - radius],
         [x + radius, y - radius],
@@ -236,13 +234,13 @@ fn square(center: &Point, radius: f64) -> Vec<[f64; 2]> {
 // The buffer of a point geo: one circle per point (a square with
 // `endcap=square`, as in PostGIS), unioned when there are several
 // (overlapping ones merge).
-fn buffer_points(points: &[Point], radius: f64, style: &BufferStyle) -> Vec<Shape> {
+fn buffer_points(points: &[[f64; 2]], radius: f64, style: &BufferStyle) -> Vec<Shape> {
     if radius <= 0.0 {
         return Vec::new();
     }
     let mut rings: Vec<Vec<[f64; 2]>> = points
         .iter()
-        .map(|p| match style.endcap {
+        .map(|&p| match style.endcap {
             EndCap::Square => square(p, radius),
             _ => circle(p, radius, style.quad_segs),
         })
@@ -380,16 +378,16 @@ impl ScalarUDFImpl for StBufferUdf {
 
     // Reject bare binary: the operand must be tagged geometry.
     fn return_field_from_args(&self, args: ReturnFieldArgs) -> Result<FieldRef> {
-        require_geometry(args.arg_fields[0].as_ref())?;
-        Ok(geometry_field(self.name(), DataType::Binary, true))
+        let geo_type = GeoType::from_field(self.name(), args.arg_fields[0].as_ref())?;
+        Ok(geo_type.to_field(self.name(), DataType::Binary, true))
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         let arrays = ColumnarValue::values_to_arrays(&args.args)?;
-        let geoms = &arrays[0];
+        let geoms = RawGeo::try_new(args.arg_fields[0].as_ref(), Arc::clone(&arrays[0]))?;
         let radii = cast(&arrays[1], &DataType::Float64)?;
         let radii = as_float64_array(&radii)?;
-        let n = geoms.len();
+        let n = arrays[0].len();
 
         // The style is usually a literal, so parse it once when it is a
         // scalar; otherwise parse per row. None marks a null style (null row).
@@ -402,19 +400,8 @@ impl ScalarUDFImpl for StBufferUdf {
             Some(styles) => Box::new(move |i| style_from_array(styles, i)),
         };
 
-        let mut buf = Vec::new();
-        let mut builder = BinaryBuilder::with_capacity(n, 0);
-        for i in 0..n {
-            let radius = (!radii.is_null(i)).then(|| radii.value(i));
-            let (Some(bytes), Some(radius), Some(style)) = (wkb_at(geoms, i), radius, style_at(i)?)
-            else {
-                builder.append_null();
-                continue;
-            };
-            st_buffer(bytes, radius, &style, &mut buf)?;
-            builder.append_value(&buf);
-        }
-        Ok(ColumnarValue::Array(Arc::new(builder.finish())))
+        let radius_at = |i| (!radii.is_null(i)).then(|| radii.value(i));
+        Ok(geoms.buffer(radius_at, style_at)?.into_columnar_value())
     }
 }
 
@@ -443,6 +430,7 @@ fn style_from_array(styles: &arrow_array::ArrayRef, i: usize) -> Result<Option<B
 mod test_helpers {
     use geos::{BufferParams, CapStyle, Geom, JoinStyle};
 
+    use super::super::super::test_utils::iou;
     pub(super) use super::super::super::test_utils::wkt_to_wkb;
     use super::{st_buffer, BufferStyle, EndCap, Join};
 
@@ -484,21 +472,19 @@ mod test_helpers {
 
         let mut buf = Vec::new();
         st_buffer(&bytes, radius, style, &mut buf).unwrap();
-        let ours = geos::Geometry::new_from_wkb(&buf).unwrap();
+        let res = geos::Geometry::new_from_wkb(&buf).unwrap();
         assert!(
-            ours.is_valid(),
+            res.is_valid(),
             "{label}: invalid output: {}",
-            ours.is_valid_reason().unwrap()
+            res.is_valid_reason().unwrap()
         );
 
         if expect_empty {
             assert!(geos_result.is_empty().unwrap(), "{label}: GEOS not empty");
-            assert!(ours.is_empty().unwrap(), "{label}: ours not empty");
+            assert!(res.is_empty().unwrap(), "{label}: res not empty");
             return;
         }
-        let inter = geos_result.intersection(&ours).unwrap().area().unwrap();
-        let union = geos_result.union(&ours).unwrap().area().unwrap();
-        let iou = inter / union;
+        let iou = iou(&geos_result, &res);
         assert!((iou - 1.0).abs() < tol, "{label}: IoU {iou}");
     }
 }

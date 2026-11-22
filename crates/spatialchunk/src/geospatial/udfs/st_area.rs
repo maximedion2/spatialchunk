@@ -12,64 +12,18 @@
 
 use std::sync::Arc;
 
-use arrow_array::builder::Float64Builder;
 use arrow_schema::{DataType, Field, FieldRef};
-use datafusion::common::{exec_datafusion_err, Result};
+use datafusion::common::Result;
 use datafusion::logical_expr::{
     ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl, Signature, TypeSignature,
     Volatility,
 };
-use geo_traits::{
-    CoordTrait, GeometryTrait, GeometryType, LineStringTrait, MultiPolygonTrait, PolygonTrait,
-};
-use wkb::reader::Wkb;
 
-use super::spatial_predicate_udfs::wkb_at;
-use super::st_geomfrom::require_geometry;
+use crate::geospatial::geos::raw_geo::{GeoType, RawGeo};
 
-// *************************************************************
-// area(geo) -> the planar area of a geometry. Only polygons have area; points
-// and lines are 0. A polygon's area is its shell area minus the area of each
-// hole. Ring role (shell vs hole) comes from the WKB structure, not winding, so
-// each ring is measured by the absolute value of its shoelace sum.
-// *************************************************************
-fn st_area(wkb: &Wkb) -> f64 {
-    match wkb.as_type() {
-        GeometryType::Polygon(poly) => polygon_area(&poly),
-        GeometryType::MultiPolygon(mp) => mp.polygons().map(|p| polygon_area(&p)).sum(),
-        _ => 0.0,
-    }
-}
-
-fn polygon_area(poly: &impl PolygonTrait<T = f64>) -> f64 {
-    let shell = poly.exterior().map(|r| ring_area(&r)).unwrap_or(0.0);
-    let holes: f64 = poly.interiors().map(|h| ring_area(&h)).sum();
-    shell - holes
-}
-
-// Absolute area of a single ring via the shoelace formula. Coordinates are
-// shifted by the first vertex before the cross products to keep precision when
-// the ring sits far from the origin. A WKB ring is closed (last == first), so
-// summing consecutive pairs in order already covers the wraparound term.
-fn ring_area(ring: &impl LineStringTrait<T = f64>) -> f64 {
-    let mut coords = ring.coords();
-    let Some(origin) = coords.next() else {
-        return 0.0;
-    };
-    let (ox, oy) = (origin.x(), origin.y());
-
-    let mut sum = 0.0;
-    let (mut px, mut py) = (0.0, 0.0);
-    for c in coords {
-        let (cx, cy) = (c.x() - ox, c.y() - oy);
-        sum += px * cy - cx * py;
-        (px, py) = (cx, cy);
-    }
-    (sum / 2.0).abs()
-}
-
-/// `st_area(geom)` returns the planar area of a geometry as a `Float64`,
-/// row-wise over a WKB column.
+/// `st_area(geo)` returns the area of a geo as a `Float64`, row-wise over a WKB
+/// column: in the crs units squared for geometries, in square meters for
+/// geographies.
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct StAreaUdf {
     signature: Signature,
@@ -102,50 +56,73 @@ impl ScalarUDFImpl for StAreaUdf {
         Ok(DataType::Float64)
     }
 
-    // Reject bare binary: the operand must be tagged geometry.
     fn return_field_from_args(&self, args: ReturnFieldArgs) -> Result<FieldRef> {
-        require_geometry(args.arg_fields[0].as_ref())?;
+        GeoType::from_field(self.name(), args.arg_fields[0].as_ref())?;
         Ok(Arc::new(Field::new(self.name(), DataType::Float64, true)))
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         let arrays = ColumnarValue::values_to_arrays(&args.args)?;
-        let geoms = &arrays[0];
-        let n = geoms.len();
-
-        let mut builder = Float64Builder::with_capacity(n);
-        for i in 0..n {
-            match wkb_at(geoms, i) {
-                Some(bytes) => {
-                    let wkb = Wkb::try_new(bytes)
-                        .map_err(|e| exec_datafusion_err!("st_area: malformed WKB: {e}"))?;
-                    builder.append_value(st_area(&wkb));
-                }
-                None => builder.append_null(),
-            }
-        }
-        Ok(ColumnarValue::Array(Arc::new(builder.finish())))
+        let geos = RawGeo::try_new(args.arg_fields[0].as_ref(), Arc::clone(&arrays[0]))?;
+        Ok(ColumnarValue::Array(geos.area()?))
     }
 }
 
 #[cfg(test)]
 mod test_helpers {
+    use std::sync::Arc;
+
+    use arrow::array::AsArray;
+    use arrow::datatypes::Float64Type;
+    use arrow_array::BinaryArray;
+    use arrow_schema::{DataType, Field, FieldRef};
+    use datafusion::logical_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl};
     use geos::Geom;
+    use serde_json::Value;
 
     pub(super) use super::super::super::test_utils::wkt_to_wkb;
-    use super::{st_area, Wkb};
+    use super::StAreaUdf;
+    use crate::geospatial::geos::raw_geo::GeoType;
+
+    pub(super) fn geometry() -> FieldRef {
+        GeoType::geometry(None).to_field("geo", DataType::Binary, true)
+    }
+
+    pub(super) fn geography() -> FieldRef {
+        GeoType::geometry(Some(Value::String("EPSG:4326".into())))
+            .to_geography("test")
+            .unwrap()
+            .to_field("geo", DataType::Binary, true)
+    }
+
+    // The area of a single geo, through the udf.
+    pub(super) fn area(field: FieldRef, wkt: &str) -> f64 {
+        let bytes = wkt_to_wkb(wkt);
+        let args = ScalarFunctionArgs {
+            args: vec![ColumnarValue::Array(Arc::new(
+                BinaryArray::from_iter_values([bytes]),
+            ))],
+            arg_fields: vec![field],
+            number_rows: 1,
+            return_field: Arc::new(Field::new("st_area", DataType::Float64, true)),
+            config_options: Arc::new(datafusion::config::ConfigOptions::default()),
+        };
+        match StAreaUdf::default().invoke_with_args(args).unwrap() {
+            ColumnarValue::Array(a) => a.as_primitive::<Float64Type>().value(0),
+            _ => panic!("expected array"),
+        }
+    }
 
     // Checks st_area against GEOS's area.
     pub(super) fn compare_area(label: &str, wkt: &str) {
-        let bytes = wkt_to_wkb(wkt);
-
-        let geos_result = geos::Geometry::new_from_wkb(&bytes)
+        let geos_result = geos::Geometry::new_from_wkb(&wkt_to_wkb(wkt))
             .unwrap()
             .area()
             .unwrap();
-        let ours = st_area(&Wkb::try_new(&bytes).unwrap());
-
-        assert!((geos_result - ours).abs() < 1e-6, "{label}");
+        assert!(
+            (geos_result - area(geometry(), wkt)).abs() < 1e-6,
+            "{label}"
+        );
     }
 }
 
@@ -205,6 +182,34 @@ mod area_tests {
                 "POLYGON (({}), (-2 -2, 2 -2, 2 2, -2 2, -2 -2))",
                 decagon_ring(0.0, 0.0),
             ),
+        );
+    }
+}
+
+#[cfg(test)]
+mod geography_area_tests {
+    use s2::latlng::LatLng;
+    use s2::point::{point_area, Point};
+
+    use super::test_helpers::{area, geography};
+    use crate::geospatial::geos::raw_geo::EARTH_RADIUS_METERS;
+
+    fn s2_point(lon: f64, lat: f64) -> Point {
+        Point::from(LatLng::from_degrees(lat, lon))
+    }
+
+    #[test]
+    fn triangle() {
+        let expected = point_area(
+            &s2_point(0.0, 0.0),
+            &s2_point(1.0, 0.0),
+            &s2_point(0.0, 1.0),
+        ) * EARTH_RADIUS_METERS
+            * EARTH_RADIUS_METERS;
+        let res = area(geography(), "POLYGON ((0 0, 1 0, 0 1, 0 0))");
+        assert!(
+            ((res - expected) / expected).abs() < 1e-9,
+            "{res} vs {expected}"
         );
     }
 }

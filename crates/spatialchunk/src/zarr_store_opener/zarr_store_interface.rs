@@ -16,7 +16,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use arrow::array::*;
-use arrow::compute::kernels::aggregate::{max as arrow_max, min as arrow_min};
 use arrow::compute::kernels::cmp::{eq, gt, lt};
 use arrow::compute::{cast, cast_with_options, concat, nullif, or, take, CastOptions};
 use arrow::datatypes::*;
@@ -26,7 +25,7 @@ use bytes::Bytes;
 use chrono::{NaiveDate, NaiveDateTime, TimeDelta};
 use datafusion::common::ScalarValue;
 use datafusion::logical_expr::ColumnarValue;
-use datafusion::physical_expr::utils::{collect_columns, reassign_expr_columns};
+use datafusion::physical_expr::utils::reassign_expr_columns;
 use datafusion::physical_plan::PhysicalExpr;
 use futures::future::{BoxFuture, Shared};
 use serde_json::{Map, Value};
@@ -49,6 +48,7 @@ use super::io_runtime::IoRuntime;
 use super::metrics::ZarrMetrics;
 use super::util::{ColumnNames, NumElements};
 use super::zarr_errors::{ZarrQueryError, ZarrQueryResult};
+use crate::geospatial::probe_pruning_expr::ProbePruningExpr;
 
 //***************************************************
 // A helper struct that handles the special case where an
@@ -1506,9 +1506,9 @@ impl<T: AsyncReadableListableStorageTraits + ?Sized + 'static> ZarrStoreInterfac
         Ok(Some(read_chunk))
     }
 
-    // evaluates the chunk-pruning expression on the min/max of each pruning
-    // column. the min/max of a 1D coordinate is the same whether it's
-    // broadcast or not, so they are computed from the raw coordinate values.
+    // evaluates the chunk-pruning expression on the values of each pruning
+    // column, the 1D coordinates aren't broadcast, the expression doesn't pair
+    // the columns' values.
     pub(crate) async fn keep_chunk(
         &self,
         pruning: &ChunkPruning,
@@ -1531,8 +1531,8 @@ impl<T: AsyncReadableListableStorageTraits + ?Sized + 'static> ZarrStoreInterfac
             }
         }
 
-        let min_max = chunk.to_min_max_record_batch(&pruning.schema)?;
-        chunk_kept(&pruning.expr, &min_max)
+        let values = chunk.into_padded_record_batch(&pruning.schema)?;
+        chunk_kept(&pruning.expr, &values)
     }
 }
 
@@ -1596,23 +1596,39 @@ impl ZarrInMemoryChunk {
         Ok(RecordBatch::try_new(schema.clone(), columns)?)
     }
 
-    // a 2-row record batch holding, per column, that column's min (row 0) and
-    // max (row 1) in schema-field order.
-    fn to_min_max_record_batch(&self, schema: &SchemaRef) -> ZarrQueryResult<RecordBatch> {
-        let min_max = self
-            .columns_in_schema_order(schema)?
-            .iter()
-            .zip(schema.fields())
-            .map(|(arr, f)| Ok((f.name().clone(), min_max_array(arr)?)))
+    // a record batch of the columns in schema-field order, whose lengths can
+    // differ, e.g. 1D coordinates that aren't broadcast. the shorter ones are
+    // padded with nulls, so the fields are made nullable.
+    fn into_padded_record_batch(self, schema: &SchemaRef) -> ZarrQueryResult<RecordBatch> {
+        let columns = self.columns_in_schema_order(schema)?;
+        let num_rows = columns.iter().map(|c| c.len()).max().unwrap_or(0);
+        let columns = columns
+            .into_iter()
+            .map(|c| {
+                if c.len() == num_rows {
+                    return Ok(c);
+                }
+                let padding = new_null_array(c.data_type(), num_rows - c.len());
+                Ok(concat(&[c.as_ref(), padding.as_ref()])?)
+            })
             .collect::<ZarrQueryResult<Vec<_>>>()?;
-        Ok(RecordBatch::try_from_iter(min_max)?)
+        let fields: Vec<Field> = schema
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone().with_nullable(true))
+            .collect();
+        let options = RecordBatchOptions::new().with_row_count(Some(num_rows));
+        Ok(RecordBatch::try_new_with_options(
+            Arc::new(Schema::new(fields)),
+            columns,
+            &options,
+        )?)
     }
 }
 
 //***************************************************
 // A resolved chunk-pruning expression and the subset schema it reads.
-// This is currently used for pruning based on spatial joins, and the logic
-// relies on the pruning only depending on the min/max of all the columns.
+// This is currently used for pruning based on spatial joins.
 //***************************************************
 pub(crate) struct ChunkPruning {
     expr: Arc<dyn PhysicalExpr>,
@@ -1622,14 +1638,20 @@ pub(crate) struct ChunkPruning {
 impl ChunkPruning {
     // Selects the columns `expr` references from `projected_schema` (by name)
     // into a subset schema, and reassigns the expression's column indices to it
-    // so it evaluates against a min/max batch built from that subset.
+    // so it evaluates against a batch built from that subset.
     pub(crate) fn try_new(
         expr: Arc<dyn PhysicalExpr>,
         projected_schema: &SchemaRef,
     ) -> ZarrQueryResult<Self> {
-        let mut indices = collect_columns(&expr)
+        let pruning = expr.downcast_ref::<ProbePruningExpr>().ok_or_else(|| {
+            ZarrQueryError::InvalidCompute(
+                "the chunk-pruning expression isn't a ProbePruningExpr".into(),
+            )
+        })?;
+        let mut indices = pruning
+            .columns()
             .iter()
-            .map(|c| projected_schema.index_of(c.name()))
+            .map(|c| projected_schema.index_of(c))
             .collect::<Result<Vec<_>, _>>()?;
         indices.sort_unstable();
         indices.dedup();
@@ -1640,10 +1662,10 @@ impl ChunkPruning {
     }
 }
 
-// Evaluates a chunk-pruning expression against a chunk's min/max record batch,
-// returning whether the chunk should be kept (a null verdict keeps it).
-fn chunk_kept(expr: &Arc<dyn PhysicalExpr>, min_max: &RecordBatch) -> ZarrQueryResult<bool> {
-    let value = expr.evaluate(min_max)?;
+// Evaluates a chunk-pruning expression against a chunk's values, returning
+// whether the chunk should be kept (a null verdict keeps it).
+fn chunk_kept(expr: &Arc<dyn PhysicalExpr>, values: &RecordBatch) -> ZarrQueryResult<bool> {
+    let value = expr.evaluate(values)?;
     match value {
         ColumnarValue::Scalar(ScalarValue::Boolean(Some(keep))) => Ok(keep),
         ColumnarValue::Scalar(ScalarValue::Boolean(None)) => Ok(true),
@@ -1651,42 +1673,6 @@ fn chunk_kept(expr: &Arc<dyn PhysicalExpr>, min_max: &RecordBatch) -> ZarrQueryR
             "chunk-pruning expression must return a boolean scalar, got {other:?}"
         ))),
     }
-}
-
-// Returns a length-2 array `[min, max]` of the same numeric type as `array`.
-// `None` min/max (empty or all-null input) become nulls.
-fn min_max_array(array: &ArrayRef) -> ZarrQueryResult<ArrayRef> {
-    macro_rules! min_max {
-        ($ty:ty) => {{
-            let a = array
-                .as_any()
-                .downcast_ref::<PrimitiveArray<$ty>>()
-                .expect("array data type matched");
-            Arc::new(PrimitiveArray::<$ty>::from(vec![
-                arrow_min(a),
-                arrow_max(a),
-            ])) as ArrayRef
-        }};
-    }
-
-    let out = match array.data_type() {
-        DataType::Float64 => min_max!(Float64Type),
-        DataType::Float32 => min_max!(Float32Type),
-        DataType::Int64 => min_max!(Int64Type),
-        DataType::Int32 => min_max!(Int32Type),
-        DataType::Int16 => min_max!(Int16Type),
-        DataType::Int8 => min_max!(Int8Type),
-        DataType::UInt64 => min_max!(UInt64Type),
-        DataType::UInt32 => min_max!(UInt32Type),
-        DataType::UInt16 => min_max!(UInt16Type),
-        DataType::UInt8 => min_max!(UInt8Type),
-        other => {
-            return Err(ZarrQueryError::InvalidColumnRequest(format!(
-                "min/max not supported for data type {other}"
-            )))
-        }
-    };
-    Ok(out)
 }
 
 fn dim_names<T: ?Sized>(arr: &Array<T>) -> ZarrQueryResult<Option<Vec<String>>> {

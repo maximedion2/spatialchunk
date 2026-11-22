@@ -901,7 +901,7 @@ mod table_provider_tests {
         // up twice.
         let query = "
             WITH boxes AS (
-                SELECT st_geomfromwkt(wkt) AS geom
+                SELECT st_geomfromwkt(wkt, 'EPSG:4326') AS geom
                 FROM (VALUES
                     ('POLYGON((2.5 8.5, 3.5 8.5, 3.5 9.5, 2.5 9.5, 2.5 8.5))'),
                     ('POLYGON((3.5 7.5, 4.5 7.5, 4.5 8.5, 3.5 8.5, 3.5 7.5))')

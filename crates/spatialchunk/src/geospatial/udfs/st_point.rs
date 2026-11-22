@@ -10,27 +10,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::io::Cursor;
-use std::sync::Arc;
-
-use arrow_array::builder::BinaryBuilder;
-use arrow_array::Array;
 use arrow_schema::{DataType, FieldRef};
 use datafusion::common::cast::as_float64_array;
 use datafusion::common::Result;
 use datafusion::logical_expr::{
-    ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility,
+    ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl, Signature,
 };
-use geo_types::Point;
-use wkb::writer::{write_point, WriteOptions};
 
-use super::st_geomfrom::geometry_field;
+use super::udf_helpers::{crs_argument, signature_with_optional_crs, GeoMetadata};
+use crate::geospatial::geos::raw_geo::{GeoType, RawGeo};
 
-/// Byte length of a 2D WKB point: 1 (byte order) + 4 (geometry type) + 2 * 8 (x, y).
-const WKB_POINT_2D_LEN: usize = 21;
-
-/// `st_point(x, y)` constructs a WKB point from two `Float64` coordinate columns,
-/// returning a binary array.
+/// `st_point(x, y [, crs])` constructs a WKB point from two `Float64` coordinate
+/// columns, returning a binary array, tagged with the crs if given.
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct StPointUdf {
     signature: Signature,
@@ -40,10 +31,10 @@ impl Default for StPointUdf {
     fn default() -> Self {
         Self {
             // Exact Float64 args; DataFusion coerces other numeric inputs to Float64.
-            signature: Signature::exact(
-                vec![DataType::Float64, DataType::Float64],
-                Volatility::Immutable,
-            ),
+            signature: signature_with_optional_crs(vec![vec![
+                DataType::Float64,
+                DataType::Float64,
+            ]]),
         }
     }
 }
@@ -62,38 +53,29 @@ impl ScalarUDFImpl for StPointUdf {
     }
 
     // st_point builds a geometry, so its output is tagged as WKB geometry.
-    fn return_field_from_args(&self, _: ReturnFieldArgs) -> Result<FieldRef> {
-        Ok(geometry_field(self.name(), DataType::Binary, true))
+    fn return_field_from_args(&self, args: ReturnFieldArgs) -> Result<FieldRef> {
+        let crs = crs_argument(self.name(), &args, 2)?;
+        Ok(GeoType::geometry(crs).to_field(self.name(), DataType::Binary, true))
     }
 
+    // the crs was resolved at planning, it's on the return field.
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         let arrays = ColumnarValue::values_to_arrays(&args.args)?;
         let xs = as_float64_array(&arrays[0])?;
         let ys = as_float64_array(&arrays[1])?;
+        let crs = GeoMetadata::from_field(&args.return_field)?.crs;
 
-        let opts = WriteOptions::default();
-        // Every point is exactly WKB_POINT_2D_LEN bytes, so a fixed buffer is fully
-        // overwritten each row via a cursor.
-        let mut buf = [0u8; WKB_POINT_2D_LEN];
-        let mut builder = BinaryBuilder::with_capacity(xs.len(), xs.len() * WKB_POINT_2D_LEN);
-        for i in 0..xs.len() {
-            if xs.is_null(i) || ys.is_null(i) {
-                builder.append_null();
-                continue;
-            }
-            let pt = Point::new(xs.value(i), ys.value(i));
-            write_point(&mut Cursor::new(&mut buf[..]), &pt, &opts)
-                .map_err(|e| datafusion::common::exec_datafusion_err!("st_point: {e}"))?;
-            builder.append_value(buf);
-        }
-
-        Ok(ColumnarValue::Array(Arc::new(builder.finish())))
+        let points = xs.iter().zip(ys.iter()).map(|(x, y)| x.zip(y));
+        let points = RawGeo::from_points(points, crs)?;
+        Ok(points.into_columnar_value())
     }
 }
 
 #[cfg(test)]
 mod udf_tests {
-    use arrow_array::{BinaryArray, Float64Array};
+    use std::sync::Arc;
+
+    use arrow_array::{Array, BinaryArray, Float64Array};
     use arrow_schema::Field;
     use geo_traits::{CoordTrait, GeometryTrait, GeometryType, PointTrait};
     use wkb::reader::Wkb;

@@ -16,13 +16,28 @@ use std::time::Instant;
 use datafusion::arrow::util::pretty::pretty_format_batches;
 use datafusion::datasource::listing::ListingTableUrl;
 use datafusion::error::Result;
+use datafusion::prelude::SessionContext;
 use spatialchunk::zarr_session_context;
 use zarrs_object_store::object_store::aws::AmazonS3Builder;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let ctx = zarr_session_context()?;
+    register_tables(&ctx).await?;
 
+    // evaluate the parquet filters while decoding, so the large columns (e.g. the
+    // geometries) are only decoded for the few rows that pass.
+    ctx.sql("SET datafusion.execution.parquet.pushdown_filters = true")
+        .await?
+        .collect()
+        .await?;
+
+    geometry_join(&ctx).await?;
+    geography_join(&ctx).await?;
+    Ok(())
+}
+
+async fn register_tables(ctx: &SessionContext) -> Result<()> {
     // county polygons from overture maps (parquet on s3). datafusion needs an
     // object store registered for the bucket to read it.
     let overture_bucket = "s3://overturemaps-us-west-2";
@@ -56,10 +71,13 @@ async fn main() -> Result<()> {
          )",
     )
     .await?;
+    Ok(())
+}
 
-    // the average 2m temperature in each county around the bay area, on
-    // 2024-01-01 at 10:00. longitudes go from 0 to 360, they're shifted to
-    // -180 to 180 to match the overture geometries.
+// the average 2m temperature in each county around the bay area, on 2024-01-01
+// at 10:00. longitudes go from 0 to 360, they're shifted to -180 to 180 to
+// match the overture geometries.
+async fn geometry_join(ctx: &SessionContext) -> Result<()> {
     let query = "
         WITH counties AS (
             SELECT names['primary'] AS name, st_geomfromwkb(geometry) AS geom
@@ -86,14 +104,45 @@ async fn main() -> Result<()> {
         GROUP BY c.name
         ORDER BY c.name
     ";
+    println!("geometry join");
+    run_with_and_without_dynamic_filters(ctx, query).await
+}
 
-    // evaluate the parquet filters while decoding, so the large columns (e.g. the
-    // geometries) are only decoded for the few rows that pass.
-    ctx.sql("SET datafusion.execution.parquet.pushdown_filters = true")
-        .await?
-        .collect()
-        .await?;
+// the same as `geometry_join`, with the counties and the points as geographies.
+async fn geography_join(ctx: &SessionContext) -> Result<()> {
+    let query = "
+        WITH counties AS (
+            SELECT
+                names['primary'] AS name,
+                st_togeography(st_geomfromwkb(geometry, 'EPSG:4326')) AS geog
+            FROM division_areas
+            WHERE subtype = 'county'
+                AND class = 'land'
+                AND bbox['xmin'] < -118
+                AND bbox['xmax'] > -121
+                AND bbox['ymin'] < 39
+                AND bbox['ymax'] > 36
+        ),
+        temperature AS (
+            SELECT
+                latitude AS lat,
+                CASE WHEN longitude > 180 THEN longitude - 360 ELSE longitude END AS lon,
+                t2m AS temperature
+            FROM era5
+            WHERE valid_time = TIMESTAMP '2024-01-01T10:00:00'
+        )
+        SELECT c.name, avg(t.temperature) AS avg_temperature
+        FROM counties c
+        JOIN temperature t
+            ON st_within(st_togeography(st_point(t.lon, t.lat, 'EPSG:4326')), c.geog)
+        GROUP BY c.name
+        ORDER BY c.name
+    ";
+    println!("geography join");
+    run_with_and_without_dynamic_filters(ctx, query).await
+}
 
+async fn run_with_and_without_dynamic_filters(ctx: &SessionContext, query: &str) -> Result<()> {
     // run the query with and without the spatial join's dynamic filter, which
     // prunes the era5 chunks that can't match any county.
     //
@@ -121,6 +170,5 @@ async fn main() -> Result<()> {
     }
 
     println!("results match: {}", results[0] == results[1]);
-
     Ok(())
 }
