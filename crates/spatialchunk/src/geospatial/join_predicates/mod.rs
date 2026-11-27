@@ -18,8 +18,3 @@ pub mod st_touches;
 pub mod st_within;
 
 pub(crate) use spatial_predicate::{RelationPredicate, SpatialRelationType};
-pub(crate) use st_coveredby::{st_covered_by, st_covers};
-pub(crate) use st_dwithin::st_dwithin;
-pub(crate) use st_intersects::st_intersects;
-pub(crate) use st_touches::st_touches;
-pub(crate) use st_within::{st_contains, st_within};

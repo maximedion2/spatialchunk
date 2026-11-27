@@ -15,10 +15,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 
 use arrow::compute::{interleave, nullif};
-use arrow_array::{
-    new_null_array, Array, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, RecordBatch,
-};
-use arrow_schema::DataType;
+use arrow_array::{new_null_array, Array, ArrayRef, BooleanArray, RecordBatch};
 use datafusion::common::JoinSide;
 use datafusion::error::{DataFusionError, Result};
 use futures::TryStreamExt;
@@ -27,11 +24,15 @@ use geo_index::rtree::{Node, RTree as GeoRTree, RTreeBuilder, RTreeIndex};
 use geo_types::Rect;
 
 use super::boxed_geo_batch::{BBoxedGeoBatch, BBoxedGeoStream};
-use super::joinable_geo::{GeoError, JoinableGeo};
-use crate::geospatial::join_predicates::{
-    st_contains, st_covered_by, st_covers, st_dwithin, st_intersects, st_touches, st_within,
-    SpatialRelationType,
-};
+use super::joinable_geo::{GeoKernel, JoinableGeo, Planar, Spherical};
+use crate::geospatial::common::constants::GeoError;
+use crate::geospatial::common::wkb::wkb_at;
+use crate::geospatial::join_predicates::st_coveredby::{st_covered_by, st_covers};
+use crate::geospatial::join_predicates::st_dwithin::st_dwithin;
+use crate::geospatial::join_predicates::st_intersects::st_intersects;
+use crate::geospatial::join_predicates::st_touches::st_touches;
+use crate::geospatial::join_predicates::st_within::{st_contains, st_within};
+use crate::geospatial::join_predicates::SpatialRelationType;
 
 // In-place partition of the first boundary probe entries: keep those whose
 // rect overlaps the given node bbox by swapping survivors to the front; returns
@@ -101,29 +102,18 @@ fn descend<T: RTreeIndex<f32>>(
     }
 }
 
-fn wkb_at(array: &ArrayRef, row_idx: usize) -> &[u8] {
-    match array.data_type() {
-        DataType::Binary => array
-            .as_any()
-            .downcast_ref::<BinaryArray>()
-            .expect("geometry array is Binary")
-            .value(row_idx),
-        DataType::BinaryView => array
-            .as_any()
-            .downcast_ref::<BinaryViewArray>()
-            .expect("geometry array is BinaryView")
-            .value(row_idx),
-        other => panic!("unsupported geometry array type: {other}"),
-    }
+// The wkb of an indexed geo, null geos aren't indexed.
+fn indexed_wkb(array: &ArrayRef, row_idx: usize) -> Result<&[u8], GeoError> {
+    wkb_at(array, row_idx).ok_or_else(|| GeoError::MalformedWkb("null geometry".into()))
 }
 
 // Lazy, thread-safe cache of parsed build-side JoinableGeo's.
-pub(crate) struct CachedJoinableGeo {
+pub(crate) struct CachedJoinableGeo<K: GeoKernel> {
     geo_arrays: Vec<ArrayRef>,
-    cache: Vec<Vec<AtomicPtr<JoinableGeo>>>,
+    cache: Vec<Vec<AtomicPtr<JoinableGeo<K>>>>,
 }
 
-impl CachedJoinableGeo {
+impl<K: GeoKernel> CachedJoinableGeo<K> {
     pub(crate) fn new(geo_arrays: Vec<ArrayRef>) -> Self {
         let cache = geo_arrays
             .iter()
@@ -139,7 +129,7 @@ impl CachedJoinableGeo {
     pub(crate) fn get_or_parse(
         &self,
         positions: &[(usize, usize)],
-    ) -> Result<Vec<&JoinableGeo>, GeoError> {
+    ) -> Result<Vec<&JoinableGeo<K>>, GeoError> {
         positions
             .iter()
             .map(|&(batch_idx, row_idx)| {
@@ -149,7 +139,7 @@ impl CachedJoinableGeo {
                     return Ok(unsafe { &*ptr });
                 }
                 let arr = &self.geo_arrays[batch_idx];
-                let bytes: &[u8] = wkb_at(arr, row_idx);
+                let bytes: &[u8] = indexed_wkb(arr, row_idx)?;
                 let new_ptr = Box::into_raw(Box::new(JoinableGeo::from_wkb(bytes)?));
                 match slot.compare_exchange(
                     std::ptr::null_mut(),
@@ -168,7 +158,7 @@ impl CachedJoinableGeo {
     }
 }
 
-impl Drop for CachedJoinableGeo {
+impl<K: GeoKernel> Drop for CachedJoinableGeo<K> {
     fn drop(&mut self) {
         for batch in &self.cache {
             for slot in batch {
@@ -183,11 +173,12 @@ impl Drop for CachedJoinableGeo {
 
 // Evaluates a spatial relation between a matched (build, probe) geometry pair.
 // side is which side the build geometry occupies.
-fn evaluate_relation(
+fn evaluate_relation<K: GeoKernel>(
     predicate: &SpatialRelationType,
-    build: &JoinableGeo,
-    probe: &JoinableGeo,
+    build: &JoinableGeo<K>,
+    probe: &JoinableGeo<K>,
     side: JoinSide,
+    touches: fn(&JoinableGeo<K>, &JoinableGeo<K>) -> bool,
 ) -> Result<bool, GeoError> {
     let (left, right) = match side {
         JoinSide::Left => (build, probe),
@@ -200,14 +191,19 @@ fn evaluate_relation(
         SpatialRelationType::CoveredBy => st_covered_by(left, right),
         SpatialRelationType::Covers => st_covers(left, right),
         SpatialRelationType::Intersects => st_intersects(left, right),
-        SpatialRelationType::Touches => st_touches(left, right),
+        SpatialRelationType::Touches => touches(left, right),
         SpatialRelationType::DWithin { distance } => st_dwithin(left, right, *distance),
     })
 }
 
+enum BuildGeos {
+    Planar(CachedJoinableGeo<Planar>),
+    Spherical(CachedJoinableGeo<Spherical>),
+}
+
 pub(crate) struct IndexedBuildSide {
     tree: GeoRTree<f32>,
-    joinable_geos: CachedJoinableGeo,
+    joinable_geos: BuildGeos,
     batch_positions: Vec<(usize, usize)>,
     batches: Vec<RecordBatch>,
     visited: Option<Vec<Vec<AtomicBool>>>,
@@ -250,17 +246,50 @@ impl IndexedBuildSide {
         // First find build side - probe side pairs to check
         let (probe_matched, build_matched) = self.traverse(probe_rects, probe_ids);
 
-        // Second, construct the geometries from teh binaty arrays (if they
+        match &self.joinable_geos {
+            BuildGeos::Planar(cache) => self.refine(
+                cache,
+                probe_matched,
+                build_matched,
+                probe_geo_array,
+                predicate,
+                side,
+                st_touches,
+            ),
+            BuildGeos::Spherical(cache) => self.refine(
+                cache,
+                probe_matched,
+                build_matched,
+                probe_geo_array,
+                predicate,
+                side,
+                |_, _| unreachable!("st_touches on geographies is rejected at planning"),
+            ),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn refine<K: GeoKernel>(
+        &self,
+        cache: &CachedJoinableGeo<K>,
+        probe_matched: Vec<usize>,
+        build_matched: Vec<usize>,
+        probe_geo_array: &ArrayRef,
+        predicate: &SpatialRelationType,
+        side: JoinSide,
+        touches: fn(&JoinableGeo<K>, &JoinableGeo<K>) -> bool,
+    ) -> Result<(Vec<usize>, Vec<usize>), GeoError> {
+        // Construct the geometries from teh binaty arrays (if they
         // they have not already been parsed, that's the lazy part).
         let build_positions: Vec<(usize, usize)> = build_matched
             .iter()
             .map(|&geo_id| self.batch_positions[geo_id])
             .collect();
-        let build_geos = self.joinable_geos.get_or_parse(&build_positions)?;
-        let mut probe_geos: HashMap<usize, JoinableGeo> = HashMap::new();
+        let build_geos = cache.get_or_parse(&build_positions)?;
+        let mut probe_geos: HashMap<usize, JoinableGeo<K>> = HashMap::new();
         for &probe_id in &probe_matched {
             if let Entry::Vacant(e) = probe_geos.entry(probe_id) {
-                let geo = JoinableGeo::from_wkb(wkb_at(probe_geo_array, probe_id))?;
+                let geo = JoinableGeo::from_wkb(indexed_wkb(probe_geo_array, probe_id)?)?;
                 e.insert(geo);
             }
         }
@@ -276,7 +305,7 @@ impl IndexedBuildSide {
             .zip(build_geos.iter().copied())
         {
             let probe_geo = &probe_geos[&probe_id];
-            if evaluate_relation(predicate, build_geo, probe_geo, side)? {
+            if evaluate_relation(predicate, build_geo, probe_geo, side, touches)? {
                 probe_out.push(probe_id);
                 build_out.push(geo_id);
             }
@@ -387,7 +416,12 @@ impl IndexedBuildSideBuilder {
         self.geo_arrays.push(boxed.geo_array);
     }
 
-    fn build(self, needs_visited: bool, num_probe_partitions: usize) -> IndexedBuildSide {
+    fn build(
+        self,
+        needs_visited: bool,
+        num_probe_partitions: usize,
+        is_geography: bool,
+    ) -> IndexedBuildSide {
         // Build the geo-index R-tree. add returns the insertion index in call
         // order, so adding rects in geo-id order makes insertion_index == geo_id
         // during traversal.
@@ -404,8 +438,14 @@ impl IndexedBuildSideBuilder {
                 .collect()
         });
 
+        let joinable_geos = if is_geography {
+            BuildGeos::Spherical(CachedJoinableGeo::new(self.geo_arrays.clone()))
+        } else {
+            BuildGeos::Planar(CachedJoinableGeo::new(self.geo_arrays.clone()))
+        };
+
         IndexedBuildSide {
-            joinable_geos: CachedJoinableGeo::new(self.geo_arrays.clone()),
+            joinable_geos,
             tree,
             batch_positions: self.batch_positions,
             batches: self.batches,
@@ -419,6 +459,7 @@ pub(crate) async fn build_from_streams(
     streams: Vec<BBoxedGeoStream>,
     needs_visited: bool,
     num_probe_partitions: usize,
+    is_geography: bool,
 ) -> Result<IndexedBuildSide> {
     let mut join_set = tokio::task::JoinSet::new();
 
@@ -435,7 +476,7 @@ pub(crate) async fn build_from_streams(
         builder.add_partition(batches);
     }
 
-    Ok(builder.build(needs_visited, num_probe_partitions))
+    Ok(builder.build(needs_visited, num_probe_partitions, is_geography))
 }
 
 #[cfg(test)]
@@ -448,7 +489,9 @@ pub(crate) mod test_helpers {
     use datafusion::physical_plan::PhysicalExpr;
 
     use super::{IndexedBuildSide, IndexedBuildSideBuilder};
-    use crate::geospatial::geos::boxed_geo_batch::BBoxedGeoBatch;
+    use crate::geospatial::common::wkb::{geometry_field, GeoMetadata};
+    use crate::geospatial::geos::boxed_geo_batch::{bboxed_geo_batch, BBoxedGeoBatch};
+    use crate::geospatial::geos::raw_geo::GeoType;
     use crate::geospatial::test_utils::wkt_to_wkb;
 
     pub(crate) fn make_geo_batch(
@@ -457,7 +500,9 @@ pub(crate) mod test_helpers {
         value_col: &str,
     ) -> BBoxedGeoBatch {
         let schema = Arc::new(Schema::new(vec![
-            Field::new(geo_col, DataType::Binary, false),
+            geometry_field(geo_col, DataType::Binary, false, &GeoMetadata::default())
+                .as_ref()
+                .clone(),
             Field::new(value_col, DataType::Int32, false),
         ]));
         let values: Vec<i32> = (0..wkbs.len() as i32).collect();
@@ -472,7 +517,7 @@ pub(crate) mod test_helpers {
         )
         .unwrap();
         let geo_expr = Arc::new(Column::new(geo_col, 0)) as Arc<dyn PhysicalExpr>;
-        BBoxedGeoBatch::new(batch, &geo_expr, None).unwrap()
+        bboxed_geo_batch(batch, &geo_expr, None).unwrap()
     }
 
     fn make_build_batch(
@@ -482,7 +527,9 @@ pub(crate) mod test_helpers {
         row_offset: i32,
     ) -> BBoxedGeoBatch {
         let schema = Arc::new(Schema::new(vec![
-            Field::new(geo_col, DataType::Binary, false),
+            geometry_field(geo_col, DataType::Binary, false, &GeoMetadata::default())
+                .as_ref()
+                .clone(),
             Field::new(value_col, DataType::Int32, false),
         ]));
         let wkbs: Vec<Vec<u8>> = wkts.iter().map(|wkt| wkt_to_wkb(wkt)).collect();
@@ -498,7 +545,7 @@ pub(crate) mod test_helpers {
         )
         .unwrap();
         let geo_expr = Arc::new(Column::new(geo_col, 0)) as Arc<dyn PhysicalExpr>;
-        BBoxedGeoBatch::new(batch, &geo_expr, None).unwrap()
+        bboxed_geo_batch(batch, &geo_expr, None).unwrap()
     }
 
     pub(crate) fn make_indexed_build_side(
@@ -518,7 +565,31 @@ pub(crate) mod test_helpers {
             )]);
             row_offset += chunk.len() as i32;
         }
-        Arc::new(builder.build(needs_visited, num_probe_partitions))
+        Arc::new(builder.build(needs_visited, num_probe_partitions, false))
+    }
+
+    // A single partition index of `wkts`, with the type `geo_type`, e.g. a
+    // geography, which gets geodesic bboxes.
+    pub(crate) fn make_typed_indexed_build_side(
+        wkts: &[&str],
+        geo_type: &GeoType,
+    ) -> Arc<IndexedBuildSide> {
+        let schema = Arc::new(Schema::new(vec![geo_type
+            .to_field("geometry", DataType::Binary, false)
+            .as_ref()
+            .clone()]));
+        let wkbs: Vec<Vec<u8>> = wkts.iter().map(|wkt| wkt_to_wkb(wkt)).collect();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(BinaryArray::from_iter_values(
+                wkbs.iter().map(|b| b.as_slice()),
+            ))],
+        )
+        .unwrap();
+        let geo_expr = Arc::new(Column::new("geometry", 0)) as Arc<dyn PhysicalExpr>;
+        let mut builder = IndexedBuildSideBuilder::new();
+        builder.add_partition(vec![bboxed_geo_batch(batch, &geo_expr, None).unwrap()]);
+        Arc::new(builder.build(false, 1, geo_type.is_geography()))
     }
 }
 

@@ -10,4 +10,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod spatial_join;
+pub(crate) mod constants;
+pub(crate) mod crs;
+pub(crate) mod validation;
+pub(crate) mod wkb;

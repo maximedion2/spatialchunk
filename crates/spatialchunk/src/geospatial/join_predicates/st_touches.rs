@@ -10,18 +10,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::geospatial::geos::{
-    covered_range, midpoint_ray_check, point_at_line_endpoint, point_on_segment_t,
-    ray_crosses_edge, segment_crossing_check, segment_intersection, segments_cross, Accumulator,
-    AsPoints, Bboxable, Edge, JoinableGeo, LineSegment, Point, EPS,
+use crate::geospatial::geos::joinable_geo::{
+    covered_range, interiors_same_side, midpoint_ray_check, point_at_line_endpoint,
+    point_on_segment_t, segment_crossing_check, segment_intersection, segments_cross, Accumulator,
+    Bboxable, Edge, GeoKernel, JoinableGeo, LineSegment, Planar, PlanarEdge, PlanarLineSegment,
+    PlanarPoint, Segment, EPS,
 };
 
 // *************************************************************
 // st_touches(a, b) -> true if a and b share at least one point but their
 // interiors do not intersect. Unlike st_intersects, this needs the
-// boundary/interior distinction.
+// boundary/interior distinction. Planar only: touching is exact boundary contact,
+// which geographies' curved edges don't make reliable.
 // *************************************************************
-pub(crate) fn st_touches(a: &JoinableGeo, b: &JoinableGeo) -> bool {
+pub(crate) fn st_touches(a: &JoinableGeo<Planar>, b: &JoinableGeo<Planar>) -> bool {
     match (a, b) {
         // Points have empty boundary (interior = the point), so any contact
         // between two point sets is interior–interior. Touches is never true.
@@ -78,7 +80,7 @@ pub(crate) fn st_touches(a: &JoinableGeo, b: &JoinableGeo) -> bool {
 }
 
 // Whether a hit at parameter t on a segment lies on the linestring's interior.
-fn hit_on_interior(seg: &LineSegment, t: f64) -> bool {
+fn hit_on_interior(seg: &PlanarLineSegment, t: f64) -> bool {
     if t <= EPS {
         !seg.p1_boundary()
     } else if t >= 1.0 - EPS {
@@ -97,14 +99,14 @@ fn hit_on_interior(seg: &LineSegment, t: f64) -> bool {
 // A point set touches a line if some point lies on a line boundary vertex (odd
 // mod-2 endpoint) and no point lies on the line's interior.
 pub(crate) struct PointTouchesLine<'a> {
-    points: &'a [Point],
-    lines: &'a [LineSegment],
+    points: &'a [PlanarPoint],
+    lines: &'a [PlanarLineSegment],
     found_touch: bool,
     disqualified: bool,
 }
 
 impl<'a> PointTouchesLine<'a> {
-    pub(crate) fn new(points: &'a [Point], lines: &'a [LineSegment]) -> Self {
+    pub(crate) fn new(points: &'a [PlanarPoint], lines: &'a [PlanarLineSegment]) -> Self {
         PointTouchesLine {
             points,
             lines,
@@ -115,6 +117,8 @@ impl<'a> PointTouchesLine<'a> {
 }
 
 impl Accumulator for PointTouchesLine<'_> {
+    type K = Planar;
+
     fn prune(&self, a: &impl Bboxable, b: &impl Bboxable) -> bool {
         a.box_overlap(b)
     }
@@ -130,7 +134,7 @@ impl Accumulator for PointTouchesLine<'_> {
             } else {
                 self.disqualified = true;
             }
-        } else if let Some(t) = point_on_segment_t(p, seg) {
+        } else if let Some(t) = point_on_segment_t::<Planar, _>(p, seg) {
             // Strictly interior to the segment disqualifies, t≈0/1 is an endpoint,
             // already handled above (its status is the mod-2 flag).
             if t > EPS && t < 1.0 - EPS {
@@ -151,8 +155,8 @@ impl Accumulator for PointTouchesLine<'_> {
 // A point set touches a poly if some point is on the boundary (any edge, all of
 // which are boundary) and no point is strictly inside.
 pub(crate) struct PointTouchesPoly<'a> {
-    points: &'a [Point],
-    edges: &'a [Edge],
+    points: &'a [PlanarPoint],
+    edges: &'a [PlanarEdge],
     current_group: Option<usize>,
     parity: bool,
     on_edge: bool,
@@ -161,7 +165,7 @@ pub(crate) struct PointTouchesPoly<'a> {
 }
 
 impl<'a> PointTouchesPoly<'a> {
-    pub(crate) fn new(points: &'a [Point], edges: &'a [Edge]) -> Self {
+    pub(crate) fn new(points: &'a [PlanarPoint], edges: &'a [PlanarEdge]) -> Self {
         PointTouchesPoly {
             points,
             edges,
@@ -183,6 +187,8 @@ impl<'a> PointTouchesPoly<'a> {
 }
 
 impl Accumulator for PointTouchesPoly<'_> {
+    type K = Planar;
+
     fn update(&mut self, li: usize, ri: usize) {
         if self.current_group != Some(li) {
             if self.current_group.is_some() {
@@ -198,9 +204,9 @@ impl Accumulator for PointTouchesPoly<'_> {
 
         let p = &self.points[li];
         let edge = &self.edges[ri];
-        if point_on_segment_t(p, edge).is_some() {
+        if point_on_segment_t::<Planar, _>(p, edge).is_some() {
             self.on_edge = true;
-        } else if ray_crosses_edge(p, edge, &self.edges[edge.next()]) {
+        } else if Planar::ray_crosses_edge(p, edge, &self.edges[edge.next()]) {
             self.parity = !self.parity;
         }
     }
@@ -221,14 +227,14 @@ impl Accumulator for PointTouchesPoly<'_> {
 // least one side, and no shared point is interior to both. Purely
 // pairwise, so dual descent + box_overlap.
 pub(crate) struct LineTouchesLine<'a> {
-    left: &'a [LineSegment],
-    right: &'a [LineSegment],
+    left: &'a [PlanarLineSegment],
+    right: &'a [PlanarLineSegment],
     found_touch: bool,
     disqualified: bool,
 }
 
 impl<'a> LineTouchesLine<'a> {
-    pub(crate) fn new(left: &'a [LineSegment], right: &'a [LineSegment]) -> Self {
+    pub(crate) fn new(left: &'a [PlanarLineSegment], right: &'a [PlanarLineSegment]) -> Self {
         LineTouchesLine {
             left,
             right,
@@ -247,6 +253,8 @@ impl<'a> LineTouchesLine<'a> {
 }
 
 impl Accumulator for LineTouchesLine<'_> {
+    type K = Planar;
+
     fn prune(&self, a: &impl Bboxable, b: &impl Bboxable) -> bool {
         a.box_overlap(b)
     }
@@ -254,20 +262,23 @@ impl Accumulator for LineTouchesLine<'_> {
     fn update(&mut self, li: usize, ri: usize) {
         let a = &self.left[li];
         let b = &self.right[ri];
-        if let Some((lo, hi)) = covered_range(a, b) {
+        if let Some((lo, hi)) = covered_range::<Planar, _, _>(a, b) {
             // Collinear: a positive-length overlap means the interiors overlap.
             if hi - lo > EPS {
                 self.disqualified = true;
                 return;
             }
-            let (p1, p2) = a.as_points();
-            let (t_a, a_pt) = if lo <= EPS { (0.0, p1) } else { (1.0, p2) };
+            let (t_a, a_pt) = if lo <= EPS {
+                (0.0, a.p1())
+            } else {
+                (1.0, a.p2())
+            };
             let a_interior = hit_on_interior(a, t_a);
             let b_interior = point_at_line_endpoint(a_pt, b).is_none_or(|is_boundary| !is_boundary);
             self.classify(a_interior, b_interior);
             return;
         }
-        if let Some((t, u)) = segment_intersection(a, b) {
+        if let Some((t, u)) = segment_intersection::<Planar, _, _>(a, b) {
             self.classify(hit_on_interior(a, t), hit_on_interior(b, u));
         }
     }
@@ -286,8 +297,8 @@ impl Accumulator for LineTouchesLine<'_> {
 // single descent so ray-parity sees all of a segment's candidate edges
 // contiguously,
 pub(crate) struct LineTouchesPoly<'a> {
-    left: &'a [LineSegment],
-    edges: &'a [Edge],
+    left: &'a [PlanarLineSegment],
+    edges: &'a [PlanarEdge],
     current_group: Option<usize>,
     parity: bool,
     parity_valid: bool,
@@ -296,7 +307,7 @@ pub(crate) struct LineTouchesPoly<'a> {
 }
 
 impl<'a> LineTouchesPoly<'a> {
-    pub(crate) fn new(left: &'a [LineSegment], edges: &'a [Edge]) -> Self {
+    pub(crate) fn new(left: &'a [PlanarLineSegment], edges: &'a [PlanarEdge]) -> Self {
         LineTouchesPoly {
             left,
             edges,
@@ -316,6 +327,8 @@ impl<'a> LineTouchesPoly<'a> {
 }
 
 impl Accumulator for LineTouchesPoly<'_> {
+    type K = Planar;
+
     fn update(&mut self, li: usize, ri: usize) {
         if self.current_group != Some(li) {
             if self.current_group.is_some() {
@@ -333,16 +346,18 @@ impl Accumulator for LineTouchesPoly<'_> {
         let edge = &self.edges[ri];
         let next = &self.edges[edge.next()];
 
-        if covered_range(seg, edge).is_some() || segments_cross(seg, edge) {
+        if covered_range::<Planar, _, _>(seg, edge).is_some()
+            || segments_cross::<Planar, _, _>(seg, edge)
+        {
             self.found_touch = true;
         }
 
-        let (qualifying, _) = segment_crossing_check(seg, edge, next);
+        let (qualifying, _) = segment_crossing_check::<Planar, _>(seg, edge, next);
         if qualifying {
             self.disqualified = true;
         }
 
-        let (ray, inside, parity_valid) = midpoint_ray_check(seg, edge, next);
+        let (ray, inside, parity_valid) = midpoint_ray_check::<Planar, _>(seg, edge, next);
         if ray {
             self.parity ^= true;
         }
@@ -374,8 +389,8 @@ impl Accumulator for LineTouchesPoly<'_> {
 // plus A-inside-B parity; pass 2 does only the containment parity to
 // catch B-inside-A.
 pub(crate) struct PolyTouchesPoly<'a> {
-    left: &'a [Edge],
-    right: &'a [Edge],
+    left: &'a [PlanarEdge],
+    right: &'a [PlanarEdge],
     check_crossings: bool,
     current_group: Option<usize>,
     parity: bool,
@@ -385,7 +400,11 @@ pub(crate) struct PolyTouchesPoly<'a> {
 }
 
 impl<'a> PolyTouchesPoly<'a> {
-    pub(crate) fn new(left: &'a [Edge], right: &'a [Edge], check_crossings: bool) -> Self {
+    pub(crate) fn new(
+        left: &'a [PlanarEdge],
+        right: &'a [PlanarEdge],
+        check_crossings: bool,
+    ) -> Self {
         PolyTouchesPoly {
             left,
             right,
@@ -406,6 +425,8 @@ impl<'a> PolyTouchesPoly<'a> {
 }
 
 impl Accumulator for PolyTouchesPoly<'_> {
+    type K = Planar;
+
     fn update(&mut self, li: usize, ri: usize) {
         if self.current_group != Some(li) {
             if self.current_group.is_some() {
@@ -424,26 +445,26 @@ impl Accumulator for PolyTouchesPoly<'_> {
         let next = &self.right[b.next()];
 
         if self.check_crossings {
-            if let Some((lo, hi)) = covered_range(a, b) {
+            if let Some((lo, hi)) = covered_range::<Planar, _, _>(a, b) {
                 // Collinear: a positive-length overlap is a shared boundary segment,
                 // same-side interiors overlap disqualifies, opposite-side is a touch.
-                if hi - lo > EPS && a.interiors_same_side(b) {
+                if hi - lo > EPS && interiors_same_side::<Planar>(a, b) {
                     self.disqualified = true;
                 } else {
                     self.found_touch = true;
                 }
-            } else if segments_cross(a, b) {
+            } else if segments_cross::<Planar, _, _>(a, b) {
                 self.found_touch = true;
             }
             // Transversal/vertex crossing, or collinear overlap peeling into the
             // interior → interior entry.
-            let (qualifying, _) = segment_crossing_check(a, b, next);
+            let (qualifying, _) = segment_crossing_check::<Planar, _>(a, b, next);
             if qualifying {
                 self.disqualified = true;
             }
         }
 
-        let (ray, inside, parity_valid) = midpoint_ray_check(a, b, next);
+        let (ray, inside, parity_valid) = midpoint_ray_check::<Planar, _>(a, b, next);
         if ray {
             self.parity ^= true;
         }
@@ -471,8 +492,8 @@ impl Accumulator for PolyTouchesPoly<'_> {
 mod test_helpers {
     use geos::Geom;
 
-    use super::JoinableGeo;
-    use crate::geospatial::join_predicates::st_touches;
+    use super::st_touches;
+    use crate::geospatial::geos::joinable_geo::{JoinableGeo, Planar};
     pub(super) use crate::geospatial::test_utils::wkt_to_wkb;
 
     pub(super) fn compare_touches(label: &str, wkt_a: &str, wkt_b: &str) {
@@ -483,8 +504,8 @@ mod test_helpers {
         let geos_b = geos::Geometry::new_from_wkb(&bytes_b).unwrap();
         let geos_result = geos_a.touches(&geos_b).unwrap();
 
-        let joinable_a = JoinableGeo::from_wkb(&bytes_a).unwrap();
-        let joinable_b = JoinableGeo::from_wkb(&bytes_b).unwrap();
+        let joinable_a = JoinableGeo::<Planar>::from_wkb(&bytes_a).unwrap();
+        let joinable_b = JoinableGeo::<Planar>::from_wkb(&bytes_b).unwrap();
 
         // Touches is symmetric, so both orderings must match GEOS.
         assert_eq!(geos_result, st_touches(&joinable_a, &joinable_b), "{label}");

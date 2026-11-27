@@ -19,13 +19,16 @@ use datafusion::logical_expr::{
     ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl, Signature,
 };
 
-use super::spatial_predicate_udfs::{binary_pair_signature, geo_err, wkb_at};
-use super::st_geomfrom::require_geometry;
-use crate::geospatial::geos::{JoinableGeo, Point, SegmentTrait};
-use crate::geospatial::join_predicates::st_intersects;
+use super::udf_helpers::binary_pair_signature;
+use crate::geospatial::common::constants::geo_err;
+use crate::geospatial::common::wkb::wkb_at;
+use crate::geospatial::geos::joinable_geo::{GeoKernel, JoinableGeo, Planar, Segment, Spherical};
+use crate::geospatial::geos::raw_geo::{GeoKind, GeoType};
+use crate::geospatial::join_predicates::st_intersects::st_intersects;
 
 // *************************************************************
-// distance(a, b) -> the minimum Euclidean distance between a and b.
+// distance(a, b) -> the minimum distance between a and b, in the crs units for
+// geometries, in meters for geographies.
 //
 // Unlike dwithin there's no threshold, so the natural index can't prune
 // anything: it's a brute-force min over every left/right component pair. The
@@ -34,34 +37,34 @@ use crate::geospatial::join_predicates::st_intersects;
 // they're caught up front by an intersects check. Once that's ruled out every
 // segment pair is disjoint, so `dist_sq_to_disjoint` is valid below.
 // *************************************************************
-pub(crate) fn st_distance(a: &JoinableGeo, b: &JoinableGeo) -> f64 {
+pub(crate) fn st_distance<K: GeoKernel>(a: &JoinableGeo<K>, b: &JoinableGeo<K>) -> f64 {
     if a.top_bbox_overlaps(b) && st_intersects(a, b) {
         return 0.0;
     }
-    min_dist_sq(a, b).sqrt()
+    K::from_internal_dist_sq(min_dist_sq(a, b))
 }
 
-fn min_dist_sq(a: &JoinableGeo, b: &JoinableGeo) -> f64 {
+fn min_dist_sq<K: GeoKernel>(a: &JoinableGeo<K>, b: &JoinableGeo<K>) -> f64 {
     match (a, b) {
         (JoinableGeo::Point { points: a_pts, .. }, JoinableGeo::Point { points: b_pts, .. }) => {
-            min_point_point(a_pts, b_pts)
+            min_point_point::<K>(a_pts, b_pts)
         }
 
         (JoinableGeo::Point { points, .. }, JoinableGeo::Line { lines, .. }) => {
-            min_point_segs(points, lines)
+            min_point_segs::<K, _>(points, lines)
         }
         (JoinableGeo::Point { points, .. }, JoinableGeo::Poly { edges, .. }) => {
-            min_point_segs(points, edges)
+            min_point_segs::<K, _>(points, edges)
         }
 
         (JoinableGeo::Line { lines: l_lines, .. }, JoinableGeo::Line { lines: r_lines, .. }) => {
-            min_segs_segs(l_lines, r_lines)
+            min_segs_segs::<K, _, _>(l_lines, r_lines)
         }
         (JoinableGeo::Line { lines, .. }, JoinableGeo::Poly { edges, .. }) => {
-            min_segs_segs(lines, edges)
+            min_segs_segs::<K, _, _>(lines, edges)
         }
         (JoinableGeo::Poly { edges: a_edges, .. }, JoinableGeo::Poly { edges: b_edges, .. }) => {
-            min_segs_segs(a_edges, b_edges)
+            min_segs_segs::<K, _, _>(a_edges, b_edges)
         }
 
         // distance is symmetric; reuse the arms above with the operands swapped.
@@ -71,38 +74,62 @@ fn min_dist_sq(a: &JoinableGeo, b: &JoinableGeo) -> f64 {
     }
 }
 
-fn min_point_point(a: &[Point], b: &[Point]) -> f64 {
+fn min_point_point<K: GeoKernel>(a: &[K::Point], b: &[K::Point]) -> f64 {
     let mut min = f64::INFINITY;
     for p in a {
         for q in b {
-            min = min.min(p.dist_sq(q));
+            min = min.min(K::dist_sq(p, q));
         }
     }
     min
 }
 
-fn min_point_segs<S: SegmentTrait>(points: &[Point], segs: &[S]) -> f64 {
+fn min_point_segs<K: GeoKernel, S: Segment<P = K::Point>>(points: &[K::Point], segs: &[S]) -> f64 {
     let mut min = f64::INFINITY;
     for p in points {
         for s in segs {
-            min = min.min(p.dist_sq_to_segment(s));
+            min = min.min(K::dist_sq_to_segment(p, s));
         }
     }
     min
 }
 
-fn min_segs_segs<L: SegmentTrait, R: SegmentTrait>(left: &[L], right: &[R]) -> f64 {
+fn min_segs_segs<K: GeoKernel, L: Segment<P = K::Point>, R: Segment<P = K::Point>>(
+    left: &[L],
+    right: &[R],
+) -> f64 {
     let mut min = f64::INFINITY;
     for l in left {
         for r in right {
-            min = min.min(l.dist_sq_to_disjoint(r));
+            min = min.min(K::dist_sq_to_disjoint(l, r));
         }
     }
     min
 }
 
-/// `st_distance(geom, geom)` returns the minimum Euclidean distance between two
-/// geometries as a `Float64`, row-wise over two WKB columns.
+fn eval_distance<K: GeoKernel>(args: &ScalarFunctionArgs) -> Result<ColumnarValue> {
+    let arrays = ColumnarValue::values_to_arrays(&args.args)?;
+    let left = &arrays[0];
+    let right = &arrays[1];
+    let n = left.len();
+
+    let mut builder = Float64Builder::with_capacity(n);
+    for i in 0..n {
+        match (wkb_at(left, i), wkb_at(right, i)) {
+            (Some(a), Some(b)) => {
+                let a = JoinableGeo::<K>::from_wkb(a).map_err(geo_err)?;
+                let b = JoinableGeo::<K>::from_wkb(b).map_err(geo_err)?;
+                builder.append_value(st_distance(&a, &b));
+            }
+            _ => builder.append_null(),
+        }
+    }
+    Ok(ColumnarValue::Array(Arc::new(builder.finish())))
+}
+
+/// `st_distance(geom, geom)` returns the minimum distance between two geos as a
+/// `Float64`, row-wise over two WKB columns: in the crs units for geometries, in
+/// meters for geographies.
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct StDistanceUdf {
     signature: Signature,
@@ -129,31 +156,21 @@ impl ScalarUDFImpl for StDistanceUdf {
         Ok(DataType::Float64)
     }
 
-    // Reject bare binary: both operands must be tagged geometry.
     fn return_field_from_args(&self, args: ReturnFieldArgs) -> Result<FieldRef> {
-        require_geometry(args.arg_fields[0].as_ref())?;
-        require_geometry(args.arg_fields[1].as_ref())?;
+        GeoType::from_fields(
+            self.name(),
+            args.arg_fields[0].as_ref(),
+            args.arg_fields[1].as_ref(),
+        )?;
         Ok(Arc::new(Field::new(self.name(), DataType::Float64, true)))
     }
 
+    // both operands have the same type, checked at planning.
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
-        let arrays = ColumnarValue::values_to_arrays(&args.args)?;
-        let left = &arrays[0];
-        let right = &arrays[1];
-        let n = left.len();
-
-        let mut builder = Float64Builder::with_capacity(n);
-        for i in 0..n {
-            match (wkb_at(left, i), wkb_at(right, i)) {
-                (Some(a), Some(b)) => {
-                    let a = JoinableGeo::from_wkb(a).map_err(geo_err)?;
-                    let b = JoinableGeo::from_wkb(b).map_err(geo_err)?;
-                    builder.append_value(st_distance(&a, &b));
-                }
-                _ => builder.append_null(),
-            }
+        match GeoType::from_field(self.name(), args.arg_fields[0].as_ref())?.kind() {
+            GeoKind::Geometry => eval_distance::<Planar>(&args),
+            GeoKind::Geography => eval_distance::<Spherical>(&args),
         }
-        Ok(ColumnarValue::Array(Arc::new(builder.finish())))
     }
 }
 
@@ -162,7 +179,7 @@ mod test_helpers {
     use geos::Geom;
 
     pub(super) use super::super::super::test_utils::wkt_to_wkb;
-    use super::{st_distance, JoinableGeo};
+    use super::{st_distance, JoinableGeo, Planar};
 
     // Checks st_distance against GEOS's distance, both operand orders since
     // distance is symmetric.
@@ -174,8 +191,8 @@ mod test_helpers {
         let geos_b = geos::Geometry::new_from_wkb(&bytes_b).unwrap();
         let geos_result = geos_a.distance(&geos_b).unwrap();
 
-        let joinable_a = JoinableGeo::from_wkb(&bytes_a).unwrap();
-        let joinable_b = JoinableGeo::from_wkb(&bytes_b).unwrap();
+        let joinable_a = JoinableGeo::<Planar>::from_wkb(&bytes_a).unwrap();
+        let joinable_b = JoinableGeo::<Planar>::from_wkb(&bytes_b).unwrap();
 
         assert!(
             (geos_result - st_distance(&joinable_a, &joinable_b)).abs() < 1e-9,
@@ -185,6 +202,58 @@ mod test_helpers {
             (geos_result - st_distance(&joinable_b, &joinable_a)).abs() < 1e-9,
             "{label}, reversed"
         );
+    }
+}
+
+#[cfg(test)]
+mod geography_distance_tests {
+    use s2::edgeutil::distance_from_segment;
+    use s2::latlng::LatLng;
+    use s2::point::Point;
+
+    use super::test_helpers::wkt_to_wkb;
+    use super::{st_distance, JoinableGeo, Spherical};
+    use crate::geospatial::common::constants::EARTH_RADIUS_METERS;
+
+    fn geography(wkt: &str) -> JoinableGeo<Spherical> {
+        JoinableGeo::from_wkb(&wkt_to_wkb(wkt)).unwrap()
+    }
+
+    fn s2_point(lon: f64, lat: f64) -> Point {
+        Point::from(LatLng::from_degrees(lat, lon))
+    }
+
+    #[test]
+    fn intersecting_polys() {
+        let a = geography("POLYGON ((0 0, 4 0, 4 4, 0 4, 0 0))");
+        let b = geography("POLYGON ((2 2, 6 2, 6 6, 2 6, 2 2))");
+        assert_eq!(st_distance(&a, &b), 0.0);
+        assert_eq!(st_distance(&b, &a), 0.0);
+    }
+
+    // the triangle's apex points at the segment, about 1 degree away, so the
+    // distance is the apex's distance to the segment.
+    #[test]
+    fn triangle_apex_to_segment() {
+        let triangle = geography("POLYGON ((1 1, 3 0, 3 2, 1 1))");
+        let segment = geography("LINESTRING (0 0, 0 2)");
+
+        let expected = distance_from_segment(
+            &s2_point(1.0, 1.0),
+            &s2_point(0.0, 0.0),
+            &s2_point(0.0, 2.0),
+        )
+        .rad()
+            * EARTH_RADIUS_METERS;
+        for distance in [
+            st_distance(&triangle, &segment),
+            st_distance(&segment, &triangle),
+        ] {
+            assert!(
+                ((distance - expected) / expected).abs() < 1e-6,
+                "{distance} vs {expected}"
+            );
+        }
     }
 }
 

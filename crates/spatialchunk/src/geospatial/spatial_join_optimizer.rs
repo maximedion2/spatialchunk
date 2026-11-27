@@ -29,8 +29,8 @@ use datafusion::physical_plan::{
 };
 
 use super::spatial_join_exec::SpatialJoinExec;
+use crate::geospatial::geos::raw_geo::GeoType;
 use crate::geospatial::join_predicates::{RelationPredicate, SpatialRelationType};
-use crate::geospatial::udfs::st_geomfrom::require_geometry;
 
 // A matched spatial predicate plus any leftover (non-spatial) predicate that
 // must still be applied as a join filter.
@@ -227,21 +227,23 @@ fn match_relation_predicate(
     // Now that we know this is a spatial predicate, enforce that both geometry
     // operands are tagged geometry (mirrors the UDF's planning-time check, so a
     // join built without going through the UDFs can't run against bare binary).
-    require_geometry(args[0].return_field(schema)?.as_ref())?;
-    require_geometry(args[1].return_field(schema)?.as_ref())?;
+    let field0 = args[0].return_field(schema)?;
+    let field1 = args[1].return_field(schema)?;
+    let is_geography = GeoType::from_fields(name, &field0, &field1)?.is_geography();
 
     let arg0 = reproject_for_side(&args[0], col_indices, side0);
     let arg1 = reproject_for_side(&args[1], col_indices, side1);
 
     Ok(match (side0, side1) {
         (JoinSide::Left, JoinSide::Right) => {
-            Some(RelationPredicate::new(arg0, arg1, relation_type))
+            Some(RelationPredicate::new(arg0, arg1, relation_type).with_is_geography(is_geography))
         }
         // Arguments reference the join sides in reverse (right-first).  Order by
         // swapping the operands and using the opposite relation.
-        (JoinSide::Right, JoinSide::Left) => {
-            Some(RelationPredicate::new(arg1, arg0, relation_type.opposite()))
-        }
+        (JoinSide::Right, JoinSide::Left) => Some(
+            RelationPredicate::new(arg1, arg0, relation_type.opposite())
+                .with_is_geography(is_geography),
+        ),
         _ => None,
     })
 }
@@ -336,13 +338,13 @@ mod optimizer_tests {
 
     use super::super::udfs::{StDWithinUdf, StWithinUdf};
     use super::*;
+    use crate::geospatial::common::wkb::{geometry_field, GeoMetadata};
     use crate::geospatial::join_predicates::SpatialRelationType;
-    use crate::geospatial::udfs::st_geomfrom::geometry_field;
 
     // The field metadata a real geometry column carries (the `geoarrow.wkb`
     // extension tag), reused to build tagged filter-schema fields.
     fn geo_meta() -> HashMap<String, String> {
-        geometry_field("g", DataType::Binary, true)
+        geometry_field("g", DataType::Binary, true, &GeoMetadata::default())
             .metadata()
             .clone()
     }

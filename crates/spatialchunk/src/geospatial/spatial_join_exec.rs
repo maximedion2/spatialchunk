@@ -40,6 +40,7 @@ use crate::geospatial::geos::{build_from_streams, BBoxedGeoStream, IndexedBuildS
 use crate::geospatial::join_predicates::{RelationPredicate, SpatialRelationType};
 use crate::geospatial::probe_pruning_expr::ProbePruningExpr;
 use crate::geospatial::spatial_join_stream::{SharedIndexFuture, SpatialJoinStream};
+use crate::zarr_store_opener::zarr_store_interface::SpatialPruningExpr;
 
 #[derive(Debug, Clone)]
 pub struct SpatialJoinExec {
@@ -419,6 +420,7 @@ impl ExecutionPlan for SpatialJoinExec {
                     SpatialRelationType::DWithin { distance } => Some(*distance),
                     _ => None,
                 };
+                let is_geography = self.predicate.is_geography;
 
                 let fut: BoxFuture<'static, Result<Arc<IndexedBuildSide>, Arc<DataFusionError>>> =
                     Box::pin(async move {
@@ -433,19 +435,27 @@ impl ExecutionPlan for SpatialJoinExec {
                             .collect::<Result<_, Arc<DataFusionError>>>()?;
 
                         let build_side = Arc::new(
-                            build_from_streams(streams, needs_visited, probe_partition_count)
-                                .await
-                                .map_err(Arc::new)?,
+                            build_from_streams(
+                                streams,
+                                needs_visited,
+                                probe_partition_count,
+                                is_geography,
+                            )
+                            .await
+                            .map_err(Arc::new)?,
                         );
 
                         // Now that the index exists, fill in the pushed-down
                         // dynamic filter so the probe scan can prune chunks.
                         if let Some(dynamic_filter) = &dynamic_filter {
+                            // the probe pruning bounds each column's values, it
+                            // doesn't pair them, so no broadcast.
                             let pruning: Arc<dyn PhysicalExpr> = Arc::new(ProbePruningExpr::new(
                                 Arc::clone(&probe_geo_expr),
                                 Arc::clone(&build_side),
                                 probe_side_buffer,
                             ));
+                            let pruning = Arc::new(SpatialPruningExpr::new(pruning, false));
                             dynamic_filter.update(pruning).map_err(Arc::new)?;
                             dynamic_filter.mark_complete();
                         }
@@ -497,6 +507,7 @@ mod exec_tests {
     use futures::TryStreamExt;
 
     use super::SpatialJoinExec;
+    use crate::geospatial::common::wkb::{geometry_field, GeoMetadata};
     use crate::geospatial::join_predicates::{RelationPredicate, SpatialRelationType};
     use crate::geospatial::test_utils::{col1_gte_col2_filter, wkt_to_wkb};
 
@@ -535,21 +546,37 @@ mod exec_tests {
 
     fn build_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
-            Field::new("geometry_1", DataType::Binary, true),
+            geometry_field(
+                "geometry_1",
+                DataType::Binary,
+                true,
+                &GeoMetadata::default(),
+            )
+            .as_ref()
+            .clone(),
             Field::new("col_1", DataType::Int32, true),
         ]))
     }
 
     fn probe_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
-            Field::new("geometry_2", DataType::Binary, true),
+            geometry_field(
+                "geometry_2",
+                DataType::Binary,
+                true,
+                &GeoMetadata::default(),
+            )
+            .as_ref()
+            .clone(),
             Field::new("col_2", DataType::Int32, true),
         ]))
     }
 
     fn make_batch(wkts: &[&str], col_values: &[i32], geo_col: &str, val_col: &str) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
-            Field::new(geo_col, DataType::Binary, true),
+            geometry_field(geo_col, DataType::Binary, true, &GeoMetadata::default())
+                .as_ref()
+                .clone(),
             Field::new(val_col, DataType::Int32, true),
         ]));
         let wkbs: Vec<Vec<u8>> = wkts.iter().map(|wkt| wkt_to_wkb(wkt)).collect();

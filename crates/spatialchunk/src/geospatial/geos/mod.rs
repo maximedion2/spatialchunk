@@ -11,9 +11,10 @@
 // limitations under the License.
 
 pub(crate) mod boxed_geo_batch;
+pub(crate) mod buffer;
 pub(crate) mod indexed_build_side;
 pub(crate) mod joinable_geo;
+pub(crate) mod raw_geo;
 
 pub(crate) use boxed_geo_batch::*;
 pub(crate) use indexed_build_side::*;
-pub(crate) use joinable_geo::*;
