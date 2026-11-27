@@ -19,7 +19,9 @@ use datafusion::logical_expr::{
     ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl, Signature,
 };
 
-use super::spatial_predicate_udfs::{binary_pair_signature, geo_err, wkb_at};
+use super::udf_helpers::binary_pair_signature;
+use crate::geospatial::common::constants::geo_err;
+use crate::geospatial::common::wkb::wkb_at;
 use crate::geospatial::geos::joinable_geo::{GeoKernel, JoinableGeo, Planar, Segment, Spherical};
 use crate::geospatial::geos::raw_geo::{GeoKind, GeoType};
 use crate::geospatial::join_predicates::st_intersects::st_intersects;
@@ -211,7 +213,7 @@ mod geography_distance_tests {
 
     use super::test_helpers::wkt_to_wkb;
     use super::{st_distance, JoinableGeo, Spherical};
-    use crate::geospatial::geos::raw_geo::EARTH_RADIUS_METERS;
+    use crate::geospatial::common::constants::EARTH_RADIUS_METERS;
 
     fn geography(wkt: &str) -> JoinableGeo<Spherical> {
         JoinableGeo::from_wkb(&wkt_to_wkb(wkt)).unwrap()

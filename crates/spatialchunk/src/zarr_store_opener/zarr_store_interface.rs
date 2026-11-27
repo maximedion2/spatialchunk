@@ -25,7 +25,7 @@ use bytes::Bytes;
 use chrono::{NaiveDate, NaiveDateTime, TimeDelta};
 use datafusion::common::ScalarValue;
 use datafusion::logical_expr::ColumnarValue;
-use datafusion::physical_expr::utils::reassign_expr_columns;
+use datafusion::physical_expr::utils::{collect_columns, reassign_expr_columns};
 use datafusion::physical_plan::PhysicalExpr;
 use futures::future::{BoxFuture, Shared};
 use serde_json::{Map, Value};
@@ -48,7 +48,6 @@ use super::io_runtime::IoRuntime;
 use super::metrics::ZarrMetrics;
 use super::util::{ColumnNames, NumElements};
 use super::zarr_errors::{ZarrQueryError, ZarrQueryResult};
-use crate::geospatial::probe_pruning_expr::ProbePruningExpr;
 
 //***************************************************
 // A helper struct that handles the special case where an
@@ -1507,8 +1506,8 @@ impl<T: AsyncReadableListableStorageTraits + ?Sized + 'static> ZarrStoreInterfac
     }
 
     // evaluates the chunk-pruning expression on the values of each pruning
-    // column, the 1D coordinates aren't broadcast, the expression doesn't pair
-    // the columns' values.
+    // column. unless the expression pairs the columns' values, the 1D
+    // coordinates aren't broadcast.
     pub(crate) async fn keep_chunk(
         &self,
         pruning: &ChunkPruning,
@@ -1527,11 +1526,20 @@ impl<T: AsyncReadableListableStorageTraits + ?Sized + 'static> ZarrStoreInterfac
         for field in pruning.schema.fields() {
             let name = field.name();
             if let Some(coord) = self.coords.get(name) {
-                chunk.add_data(name.clone(), coord.slice(&ranges)?);
+                let values = if pruning.broadcast {
+                    coord.broadcast(&ranges)?
+                } else {
+                    coord.slice(&ranges)?
+                };
+                chunk.add_data(name.clone(), values);
             }
         }
 
-        let values = chunk.into_padded_record_batch(&pruning.schema)?;
+        let values = if pruning.broadcast {
+            chunk.into_record_batch(&pruning.schema)?
+        } else {
+            chunk.into_padded_record_batch(&pruning.schema)?
+        };
         chunk_kept(&pruning.expr, &values)
     }
 }
@@ -1627,38 +1635,104 @@ impl ZarrInMemoryChunk {
 }
 
 //***************************************************
+// A pruning expression pushed to a reader as a dynamic filter, evaluated once
+// per chunk (or row group) to a keep/skip verdict. `broadcast` is whether it
+// needs the chunk's coordinates broadcast, i.e. paired row by row, or whether
+// each column's own values are enough, e.g. to bound them.
+//***************************************************
+#[derive(Debug)]
+pub(crate) struct SpatialPruningExpr {
+    expr: Arc<dyn PhysicalExpr>,
+    broadcast: bool,
+}
+
+impl SpatialPruningExpr {
+    pub(crate) fn new(expr: Arc<dyn PhysicalExpr>, broadcast: bool) -> Self {
+        Self { expr, broadcast }
+    }
+}
+
+impl PartialEq for SpatialPruningExpr {
+    fn eq(&self, other: &Self) -> bool {
+        self.expr.eq(&other.expr) && self.broadcast == other.broadcast
+    }
+}
+
+impl Eq for SpatialPruningExpr {}
+
+impl std::hash::Hash for SpatialPruningExpr {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.expr.hash(state);
+        self.broadcast.hash(state);
+    }
+}
+
+impl std::fmt::Display for SpatialPruningExpr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SpatialPruningExpr({})", self.expr)
+    }
+}
+
+impl PhysicalExpr for SpatialPruningExpr {
+    fn data_type(&self, input_schema: &Schema) -> datafusion::error::Result<DataType> {
+        self.expr.data_type(input_schema)
+    }
+
+    fn nullable(&self, input_schema: &Schema) -> datafusion::error::Result<bool> {
+        self.expr.nullable(input_schema)
+    }
+
+    fn evaluate(&self, batch: &RecordBatch) -> datafusion::error::Result<ColumnarValue> {
+        self.expr.evaluate(batch)
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
+        vec![&self.expr]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn PhysicalExpr>>,
+    ) -> datafusion::error::Result<Arc<dyn PhysicalExpr>> {
+        Ok(Arc::new(Self::new(Arc::clone(&children[0]), self.broadcast)))
+    }
+
+    fn fmt_sql(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SpatialPruningExpr({})", self.expr)
+    }
+}
+
+//***************************************************
 // A resolved chunk-pruning expression and the subset schema it reads.
-// This is currently used for pruning based on spatial joins.
 //***************************************************
 pub(crate) struct ChunkPruning {
     expr: Arc<dyn PhysicalExpr>,
     schema: SchemaRef,
+    broadcast: bool,
 }
 
 impl ChunkPruning {
-    // Selects the columns `expr` references from `projected_schema` (by name)
-    // into a subset schema, and reassigns the expression's column indices to it
-    // so it evaluates against a batch built from that subset.
+    // Selects the columns the expression references from `projected_schema`
+    // (by name) into a subset schema, and reassigns the expression's column
+    // indices to it so it evaluates against a batch built from that subset.
     pub(crate) fn try_new(
-        expr: Arc<dyn PhysicalExpr>,
+        pruning: &SpatialPruningExpr,
         projected_schema: &SchemaRef,
     ) -> ZarrQueryResult<Self> {
-        let pruning = expr.downcast_ref::<ProbePruningExpr>().ok_or_else(|| {
-            ZarrQueryError::InvalidCompute(
-                "the chunk-pruning expression isn't a ProbePruningExpr".into(),
-            )
-        })?;
-        let mut indices = pruning
-            .columns()
+        let mut indices = collect_columns(&pruning.expr)
             .iter()
-            .map(|c| projected_schema.index_of(c))
+            .map(|c| projected_schema.index_of(c.name()))
             .collect::<Result<Vec<_>, _>>()?;
         indices.sort_unstable();
         indices.dedup();
 
         let schema = Arc::new(projected_schema.project(&indices)?);
-        let expr = reassign_expr_columns(expr, &schema)?;
-        Ok(Self { expr, schema })
+        let expr = reassign_expr_columns(Arc::clone(&pruning.expr), &schema)?;
+        Ok(Self {
+            expr,
+            schema,
+            broadcast: pruning.broadcast,
+        })
     }
 }
 

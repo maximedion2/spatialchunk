@@ -17,7 +17,8 @@ use datafusion::logical_expr::{
     ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl, Signature,
 };
 
-use super::udf_helpers::{crs_argument, signature_with_optional_crs, GeoMetadata};
+use super::udf_helpers::{crs_argument, signature_with_optional_crs};
+use crate::geospatial::common::wkb::GeoMetadata;
 use crate::geospatial::geos::raw_geo::{GeoType, RawGeo};
 
 /// `st_point(x, y [, crs])` constructs a WKB point from two `Float64` coordinate

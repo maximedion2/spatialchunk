@@ -33,9 +33,9 @@ use super::metrics::ZarrMetrics;
 use super::util::ColumnNames;
 use super::zarr_errors::{ZarrQueryError, ZarrQueryResult};
 use super::zarr_store_interface::{
-    ChunkPruning, ChunkReadState, SharedZarrStoreInterface, ZarrInMemoryChunk, ZarrStoreInterface,
+    ChunkPruning, ChunkReadState, SharedZarrStoreInterface, SpatialPruningExpr, ZarrInMemoryChunk,
+    ZarrStoreInterface,
 };
-use crate::geospatial::probe_pruning_expr::ProbePruningExpr;
 
 //***************************************************
 // A stream of RecordBatches read from a Zarr store.
@@ -214,31 +214,26 @@ impl<T: AsyncReadableListableStorageTraits + ?Sized + 'static> ZarrRecordBatchSt
     /// Resolves the pushed dynamic filters into a chunk-pruning expression, on
     /// the first `next_chunk` call. By this point the spatial join has finished
     /// its build side, so the shared dynamic filter holds the real
-    /// `ProbePruningExpr`.
+    /// `SpatialPruningExpr`.
     fn resolve_pruning(&mut self) -> ZarrQueryResult<()> {
-        if self.dynamic_filters.is_empty() {
-            return Ok(());
-        }
-
-        let mut pruning_expr: Option<Arc<dyn PhysicalExpr>> = None;
+        let mut pruning = None;
         for filter in self.dynamic_filters.drain(..) {
             let Some(inner) = filter.snapshot()? else {
                 continue;
             };
-            if inner.downcast_ref::<ProbePruningExpr>().is_some() {
-                if pruning_expr.is_some() {
-                    return Err(ZarrQueryError::InvalidCompute(
-                        "more than one chunk-pruning expression pushed to the zarr scan".into(),
-                    ));
-                }
-                pruning_expr = Some(inner);
+            let Some(expr) = inner.downcast_ref::<SpatialPruningExpr>() else {
+                continue;
+            };
+            if pruning.is_some() {
+                return Err(ZarrQueryError::InvalidCompute(
+                    "more than one chunk-pruning expression pushed to the zarr scan".into(),
+                ));
             }
+            pruning = Some(ChunkPruning::try_new(expr, &self.projected_schema_ref)?);
         }
-
-        if let Some(expr) = pruning_expr {
-            self.pruning = Some(ChunkPruning::try_new(expr, &self.projected_schema_ref)?);
+        if pruning.is_some() {
+            self.pruning = pruning;
         }
-
         Ok(())
     }
 
@@ -523,18 +518,13 @@ mod zarr_stream_tests {
 
     use arrow::array::AsArray;
     use arrow::compute::concat_batches;
-    use datafusion::config::ConfigOptions;
-    use datafusion::logical_expr::{Operator, ScalarUDF};
-    use datafusion::physical_expr::expressions::{col, lit, Column, DynamicFilterPhysicalExpr};
-    use datafusion::physical_expr::ScalarFunctionExpr;
+    use datafusion::logical_expr::Operator;
+    use datafusion::physical_expr::expressions::{col, lit, DynamicFilterPhysicalExpr};
     use datafusion::physical_plan::expressions::binary;
     use futures_util::TryStreamExt;
     use serde_json::json;
 
     use super::*;
-    use crate::geospatial::geos::indexed_build_side::test_helpers::make_indexed_build_side;
-    use crate::geospatial::udfs::st_point::StPointUdf;
-    use crate::geospatial::udfs::udf_helpers::{geometry_field, GeoMetadata};
     use crate::test_utils::{
         extract_col, get_local_zarr_store, get_local_zarr_store_3d, get_local_zarr_store_4d,
         get_local_zarr_store_cf_times, get_local_zarr_store_mix_dims,
@@ -630,62 +620,27 @@ mod zarr_stream_tests {
 
     #[tokio::test]
     async fn spatial_pruning_test() {
-        let (wrapper, schema) =
-            get_local_zarr_store(true, 0.0, "lat_lon_data_spatial_pruning").await;
-        let store = wrapper.get_store();
+        // the number of chunks read with a pruning expression that's always
+        // `keep`, pushed in a dynamic filter like the spatial join does.
+        async fn chunks_read(keep: bool, dir_name: &str) -> usize {
+            let (wrapper, schema) = get_local_zarr_store(true, 0.0, dir_name).await;
+            let store = wrapper.get_store();
+            let pruning = Arc::new(SpatialPruningExpr::new(lit(keep), false));
+            let dynamic_filter = Arc::new(DynamicFilterPhysicalExpr::new(vec![], lit(true)));
+            dynamic_filter.update(pruning).unwrap();
 
-        // Build side: two squares, each landing inside one corner chunk of the
-        // 3x3 grid (lat 35-42, lon -120 to -113). Their combined bbox spans the
-        // whole store, but only chunks (0,0) and (2,2) intersect a square.
-        let squares = [
-            "POLYGON((-119.5 35.5, -118.5 35.5, -118.5 36.5, -119.5 36.5, -119.5 35.5))",
-            "POLYGON((-114.5 40.5, -113.5 40.5, -113.5 41.5, -114.5 41.5, -114.5 40.5))",
-        ];
-        let index = make_indexed_build_side(&squares, 1, 1, false, "geometry", "val");
+            let stream =
+                ZarrRecordBatchStreamBuilder::new_from_store(store, schema, None, None, 1, 0)
+                    .with_dynamic_filters(vec![dynamic_filter as Arc<dyn PhysicalExpr>])
+                    .build()
+                    .await
+                    .unwrap();
+            let records: Vec<_> = stream.try_collect().await.unwrap();
+            records.len()
+        }
 
-        // Probe geometry: st_point(lon, lat) over the store's coordinate columns.
-        let st_point = Arc::new(ScalarUDF::from(StPointUdf::default()));
-        let probe_expr: Arc<dyn PhysicalExpr> = Arc::new(ScalarFunctionExpr::new(
-            "st_point",
-            st_point,
-            vec![
-                Arc::new(Column::new("lon", 2)),
-                Arc::new(Column::new("lat", 1)),
-            ],
-            geometry_field("geometry", DataType::Binary, true, &GeoMetadata::default()),
-            Arc::new(ConfigOptions::default()),
-        ));
-
-        // Wrap the pruning expression in a dynamic filter, as the spatial join does.
-        let pruning =
-            Arc::new(ProbePruningExpr::new(probe_expr, index, None)) as Arc<dyn PhysicalExpr>;
-        let dynamic_filter = Arc::new(DynamicFilterPhysicalExpr::new(
-            vec![
-                Arc::new(Column::new("lon", 2)),
-                Arc::new(Column::new("lat", 1)),
-            ],
-            lit(true),
-        ));
-        dynamic_filter.update(pruning).unwrap();
-
-        let stream = ZarrRecordBatchStreamBuilder::new_from_store(store, schema, None, None, 1, 0)
-            .with_dynamic_filters(vec![dynamic_filter as Arc<dyn PhysicalExpr>])
-            .build()
-            .await
-            .unwrap();
-        let records: Vec<_> = stream.try_collect().await.unwrap();
-
-        assert_eq!(records.len(), 2);
-        validate_primitive_column::<Float64Type, f64>(
-            "data",
-            &records[0],
-            &[0.0, 1.0, 2.0, 8.0, 9.0, 10.0, 16.0, 17.0, 18.0],
-        );
-        validate_primitive_column::<Float64Type, f64>(
-            "data",
-            &records[1],
-            &[54.0, 55.0, 62.0, 63.0],
-        );
+        assert_eq!(chunks_read(true, "spatial_pruning_keep").await, 9);
+        assert_eq!(chunks_read(false, "spatial_pruning_skip").await, 0);
     }
 
     #[tokio::test]

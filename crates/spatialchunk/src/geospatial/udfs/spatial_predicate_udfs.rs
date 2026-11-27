@@ -13,15 +13,17 @@
 use std::sync::Arc;
 
 use arrow_array::builder::BooleanBuilder;
-use arrow_array::{Array, ArrayRef, BinaryArray, BinaryViewArray};
+use arrow_array::Array;
 use arrow_schema::{DataType, Field, FieldRef};
 use datafusion::common::cast::as_float64_array;
-use datafusion::common::{DataFusionError, Result};
+use datafusion::common::{plan_err, Result};
 use datafusion::logical_expr::{
     ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl, Signature, TypeSignature,
     Volatility,
 };
 
+use crate::geospatial::common::constants::geo_err;
+use crate::geospatial::common::wkb::wkb_at;
 use crate::geospatial::geos::joinable_geo::{GeoKernel, JoinableGeo, Planar, Spherical};
 use crate::geospatial::geos::raw_geo::GeoType;
 use crate::geospatial::join_predicates::st_coveredby::{st_covered_by, st_covers};
@@ -29,44 +31,7 @@ use crate::geospatial::join_predicates::st_dwithin::st_dwithin;
 use crate::geospatial::join_predicates::st_intersects::st_intersects;
 use crate::geospatial::join_predicates::st_touches::st_touches;
 use crate::geospatial::join_predicates::st_within::{st_contains, st_within};
-use crate::geospatial::udfs::udf_helpers::require_planar_geometry;
-
-// Reads the WKB bytes at `row_idx`, or `None` if the row is null. The signature
-// restricts geometry inputs to Binary / BinaryView.
-pub(crate) fn wkb_at(array: &ArrayRef, row_idx: usize) -> Option<&[u8]> {
-    match array.data_type() {
-        DataType::Binary => {
-            let a = array
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .expect("geometry array is Binary");
-            (!a.is_null(row_idx)).then(|| a.value(row_idx))
-        }
-        DataType::BinaryView => {
-            let a = array
-                .as_any()
-                .downcast_ref::<BinaryViewArray>()
-                .expect("geometry array is BinaryView");
-            (!a.is_null(row_idx)).then(|| a.value(row_idx))
-        }
-        other => panic!("unsupported geometry array type: {other}"),
-    }
-}
-
-pub(crate) fn geo_err(e: impl std::error::Error + Send + Sync + 'static) -> DataFusionError {
-    DataFusionError::External(Box::new(e))
-}
-
-// The two-geometry predicate signature: (Binary, Binary) or (BinaryView, BinaryView).
-pub(crate) fn binary_pair_signature() -> Signature {
-    Signature::one_of(
-        vec![
-            TypeSignature::Exact(vec![DataType::Binary, DataType::Binary]),
-            TypeSignature::Exact(vec![DataType::BinaryView, DataType::BinaryView]),
-        ],
-        Volatility::Immutable,
-    )
-}
+use crate::geospatial::udfs::udf_helpers::binary_pair_signature;
 
 // Evaluates a binary geometry predicate row-wise over two WKB columns. A row is
 // null if either geometry is null.
@@ -173,15 +138,14 @@ impl ScalarUDFImpl for StTouchesUdf {
         Ok(DataType::Boolean)
     }
     fn return_field_from_args(&self, args: ReturnFieldArgs) -> Result<FieldRef> {
-        require_planar_geometry(self.name(), args.arg_fields[0].as_ref())?;
-        require_planar_geometry(self.name(), args.arg_fields[1].as_ref())?;
-        // we already checked for planar geometry, this call is just to validate
-        // the crs, a geography would have errored out before getting here.
-        GeoType::from_fields(
+        let geo_type = GeoType::from_fields(
             self.name(),
             args.arg_fields[0].as_ref(),
             args.arg_fields[1].as_ref(),
         )?;
+        if geo_type.is_geography() {
+            return plan_err!("{}: expected a geometry, got a geography", self.name());
+        }
         Ok(Arc::new(Field::new(self.name(), DataType::Boolean, true)))
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {

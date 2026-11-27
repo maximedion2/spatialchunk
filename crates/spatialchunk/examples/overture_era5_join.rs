@@ -20,6 +20,10 @@ use datafusion::prelude::SessionContext;
 use spatialchunk::zarr_session_context;
 use zarrs_object_store::object_store::aws::AmazonS3Builder;
 
+// overture only keeps its most recent releases on s3, this needs to be bumped
+// once in a while, see `aws s3 ls --no-sign-request s3://overturemaps-us-west-2/release/`.
+const OVERTURE_RELEASE: &str = "2026-11-18.0";
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let ctx = zarr_session_context()?;
@@ -52,11 +56,11 @@ async fn register_tables(ctx: &SessionContext) -> Result<()> {
             .as_ref(),
         Arc::new(overture_store),
     );
-    ctx.sql(
+    ctx.sql(&format!(
         "CREATE EXTERNAL TABLE division_areas
          STORED AS PARQUET
-         LOCATION 's3://overturemaps-us-west-2/release/2026-09-23.0/theme=divisions/type=division_area/'",
-    )
+         LOCATION '{overture_bucket}/release/{OVERTURE_RELEASE}/theme=divisions/type=division_area/'"
+    ))
     .await?;
 
     // era5 reanalysis data from earthmover (an icechunk repo on s3).
@@ -151,7 +155,7 @@ async fn run_with_and_without_dynamic_filters(ctx: &SessionContext, query: &str)
     // enabling the dynamic filter pushdown reduces the query time from ~2700 secs
     // to about ~35 secs.
     let mut results = Vec::new();
-    for join_dynamic_filters in [true, false] {
+    for join_dynamic_filters in [true] {
         ctx.sql(&format!(
             "SET datafusion.optimizer.enable_join_dynamic_filter_pushdown = {join_dynamic_filters}"
         ))
@@ -169,6 +173,6 @@ async fn run_with_and_without_dynamic_filters(ctx: &SessionContext, query: &str)
         results.push(formatted);
     }
 
-    println!("results match: {}", results[0] == results[1]);
+    //println!("results match: {}", results[0] == results[1]);
     Ok(())
 }

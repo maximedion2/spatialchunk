@@ -26,19 +26,21 @@ use datafusion::physical_expr::expressions::{CastExpr, Column, Literal, TryCastE
 use datafusion::physical_expr::utils::collect_columns;
 use datafusion::physical_expr::ScalarFunctionExpr;
 use datafusion::physical_plan::PhysicalExpr;
-use serde_json::Value;
+use geo_types::Rect;
 
-use crate::geospatial::geos::raw_geo::{GeoType, RawGeo, WKB_DATA_TYPES};
+use crate::geospatial::common::constants::WKB_DATA_TYPES;
+use crate::geospatial::common::crs::geography_crs;
+use crate::geospatial::geos::raw_geo::{GeoType, RawGeo};
 use crate::geospatial::geos::IndexedBuildSide;
-use crate::geospatial::udfs::st_buffer::{BufferStyle, EndCap, Join};
-use crate::geospatial::udfs::udf_helpers::GEOGRAPHY_CRS;
 
-/// A physical expression that prunes probe-side chunks against the build-side
-/// spatial index.
-///
-/// It holds the probe-side geometry expression (e.g. `st_point(lon, lat)`) as
-/// its single child — so callers know which probe columns to materialize — and
-/// the already-resolved build-side index.
+//***********************************************************************
+// A physical expression that prunes probe-side chunks against the build-side
+// spatial index.
+// It holds the probe-side geometry expression (e.g. `st_point(lon, lat)`) as
+// its single child — so callers know which probe columns to materialize — and
+// the already-resolved build-side index.
+//***********************************************************************
+
 pub(crate) struct ProbePruningExpr {
     probe_expr: Arc<dyn PhysicalExpr>,
     index: Arc<IndexedBuildSide>,
@@ -60,21 +62,15 @@ impl ProbePruningExpr {
             probe_side_buffer,
         }
     }
-
-    // The names of the columns the probe expression reads, the ones `evaluate`
-    // needs the values of.
-    pub(crate) fn columns(&self) -> Vec<String> {
-        collect_columns(&self.probe_expr)
-            .into_iter()
-            .map(|column| column.name().to_string())
-            .collect()
-    }
 }
 
-// The [min, max] of numeric values, as a 2 row batch with `field`, the field of
+//***********************************************************************
+// Various functions to handle bboxes as they traverse the physical expr.
+//***********************************************************************
+
+// The [min, max] of numeric values, as a 2 row batch with the field of
 // the expression the values come from. nulls are ignored, they're the padding
-// of the shorter columns. None if there are no values, or if the min/max isn't
-// finite, e.g. a NaN, which would wrongly fail every bbox comparison.
+// of the shorter columns. None if there are no finite values.
 fn min_max_batch(values: &ArrayRef, field: &FieldRef) -> Result<Option<RecordBatch>> {
     let as_f64 = cast(values, &DataType::Float64)?;
     let as_f64 = as_f64.as_primitive::<Float64Type>();
@@ -93,8 +89,7 @@ fn min_max_batch(values: &ArrayRef, field: &FieldRef) -> Result<Option<RecordBat
 
 // The [min, max] of a numeric expression, evaluated on all the values of the
 // single column it references, so it can be anything, e.g. a CASE that isn't
-// monotonic. None if it references more than one column, the padded columns'
-// rows don't line up.
+// monotonic. None if it references more than one column.
 fn numeric_node_batch(
     node: &Arc<dyn PhysicalExpr>,
     batch: &RecordBatch,
@@ -107,23 +102,30 @@ fn numeric_node_batch(
     min_max_batch(&values, &field)
 }
 
-// The bbox of geo values, e.g. a geo column or a geo node's output, as a
-// `RawGeo::bounds_batch` with `field`, the field of the expression the values
-// come from. it's cast back to the field's wkb type, so the next node gets the
-// type it expects. None if there are no geos or the bbox isn't valid.
-fn geo_bbox_batch(values: &ArrayRef, field: &FieldRef) -> Result<Option<RecordBatch>> {
-    let Some(bbox) = RawGeo::try_new(field, Arc::clone(values))?.overall_bbox_f64()? else {
-        return Ok(None);
-    };
-    let (min, max) = (bbox.min(), bbox.max());
-    RawGeo::bounds_batch(field, min.x, min.y, max.x, max.y)?
-        .map(|corners| with_wkb_field(corners, field))
+// Produces the bbox of geo values, e.g. a geo column or a geo node's output, as a
+// `bbox_of_rect` with `field`, the field of the expression the values come from.
+// None if there are no geos or the bbox isn't valid.
+fn bbox_of_geos(values: &ArrayRef, field: &FieldRef) -> Result<Option<RecordBatch>> {
+    match RawGeo::try_new(field, Arc::clone(values))?.overall_bbox_f64()? {
+        Some(bbox) => bbox_of_rect(field, &bbox),
+        None => Ok(None),
+    }
+}
+
+// A bbox as a batch of the `RawGeo::from_bbox` segments, cast back to the type
+// of `field`, so the next node gets the type it expects. None if the bbox
+// isn't valid.
+fn bbox_of_rect(field: &FieldRef, bbox: &Rect<f64>) -> Result<Option<RecordBatch>> {
+    // called by path since `min`/`max` are also Ord methods.
+    let (min, max) = (Rect::min(*bbox), Rect::max(*bbox));
+    RawGeo::from_bbox(field, min.x, min.y, max.x, max.y)?
+        .map(|geos| with_wkb_field(geos.into_record_batch(field.name())?, field))
         .transpose()
 }
 
-// Casts a single column wkb batch from RawGeo, always Binary, to the type of
-// `field` and gives it that field, so the next node gets the type it expects. a
-// field that isn't a wkb type can't be cast to, the batch is kept as is.
+// Gives a single column wkb batch the storage type and field of `field`, so
+// the next node gets the type it expects. a `field` that isn't a wkb type,
+// e.g. a geoarrow.polygon column, can't be cast to, the batch is kept as is.
 fn with_wkb_field(batch: RecordBatch, field: &FieldRef) -> Result<RecordBatch> {
     if !WKB_DATA_TYPES.contains(field.data_type()) {
         return Ok(batch);
@@ -133,10 +135,10 @@ fn with_wkb_field(batch: RecordBatch, field: &FieldRef) -> Result<RecordBatch> {
     Ok(RecordBatch::try_new(schema, vec![column])?)
 }
 
-// Rebinds a node to the bounds of its children: each child with bounds, a
-// single column batch, becomes a column of the returned batch, and the node
-// reads it instead of the child. a child without bounds, e.g. a literal, is
-// kept as is. the children's bounds all have the same number of rows.
+// Rebinds a physical expr node to the bounds of its physical expr children:
+// a single child column batch becomes a column of the returned batch, and
+// the parent node reads it instead of the child. a child without bounds,
+// e.g. a literal, is kept as is.
 fn rebind_children(
     node: &Arc<dyn PhysicalExpr>,
     child_bounds: Vec<Option<RecordBatch>>,
@@ -169,124 +171,49 @@ fn rebind_children(
     Ok((node, batch))
 }
 
-// The bounds of a separable geo node, one that maps its children's bounds to
-// its own, e.g. st_point or a relabel, so it's evaluated on them directly.
-fn separable_node_batch(
-    node: &Arc<dyn PhysicalExpr>,
-    child_bounds: Vec<Option<RecordBatch>>,
-) -> Result<Option<RecordBatch>> {
-    let (node, batch) = rebind_children(node, child_bounds)?;
-    let field = node.return_field(&batch.schema())?;
-    let values = node.evaluate(&batch)?.into_array(batch.num_rows())?;
-    geo_bbox_batch(&values, &field)
-}
-
-// The bounds of a buffer node: its geo child's bbox inflated by `buffer`.
-fn inflate_node_batch(
-    field: &FieldRef,
-    child_bounds: Vec<Option<RecordBatch>>,
-    buffer: f64,
-) -> Result<Option<RecordBatch>> {
-    let Some(child) = child_bounds.into_iter().flatten().next() else {
-        return Ok(None);
-    };
-    let child_field = child.schema().field(0).clone();
-    let Some(bbox) = RawGeo::try_new(&child_field, Arc::clone(child.column(0)))?
-        .with_buffer(Some(buffer))
-        .overall_bbox_f64()?
-    else {
-        return Ok(None);
-    };
-    let (min, max) = (bbox.min(), bbox.max());
-    RawGeo::bounds_batch(field, min.x, min.y, max.x, max.y)?
-        .map(|bounds| with_wkb_field(bounds, field))
-        .transpose()
-}
-
-enum Category {
-    Separable,
-    // the distance to inflate the child's bbox by.
-    Inflate(f64),
-    Unsupported,
-}
-
-// The category of a geo node, i.e. how its bounds are computed from its
-// children's. a udf's arguments other than its geo input must be literals, a
-// column one, e.g. st_buffer's radius, would pair each row's value with the
-// wrong coordinates.
-fn category(node: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Result<Category> {
+// Whether a geo node's bbox is the bbox of the node evaluated on its
+// children's bounds. a udf's arguments other than its geo input must be
+// literals, except for st_point, whose inputs are all bounded.
+fn is_supported(node: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Result<bool> {
     if node.downcast_ref::<CastExpr>().is_some() || node.downcast_ref::<TryCastExpr>().is_some() {
-        return Ok(Category::Separable);
+        return Ok(true);
     }
     let Some(f) = node.downcast_ref::<ScalarFunctionExpr>() else {
-        return Ok(Category::Unsupported);
+        return Ok(false);
     };
     let name = f.fun().name();
     if name.eq_ignore_ascii_case("st_point") {
-        return Ok(Category::Separable);
+        return Ok(true);
     }
     let args = f.args();
-    let literals: Option<Vec<&ScalarValue>> = args
+    if !args
         .iter()
         .skip(1)
-        .map(|arg| arg.downcast_ref::<Literal>().map(Literal::value))
-        .collect();
-    let Some(literals) = literals else {
-        return Ok(Category::Unsupported);
-    };
+        .all(|arg| arg.downcast_ref::<Literal>().is_some())
+    {
+        return Ok(false);
+    }
 
-    Ok(if name.eq_ignore_ascii_case("st_setcrs") {
-        Category::Separable
-    } else if name.eq_ignore_ascii_case("st_buffer") {
-        buffer_category(&literals)?
+    if name.eq_ignore_ascii_case("st_setcrs") || name.eq_ignore_ascii_case("st_buffer") {
+        Ok(true)
     } else if name.eq_ignore_ascii_case("st_togeography") {
         // only a relabel, from EPSG:4326 or a geography.
         let input = GeoType::from_field(name, args[0].return_field(schema)?.as_ref())?;
-        let geography_crs = Value::String(GEOGRAPHY_CRS.to_string());
-        if input.is_geography() || input.crs() == Some(&geography_crs) {
-            Category::Separable
-        } else {
-            Category::Unsupported
-        }
+        Ok(input.is_geography() || input.crs() == Some(&geography_crs()))
     } else {
-        Category::Unsupported
-    })
-}
-
-// A buffer extends at most its radius past the geo, times the style's widest
-// corner: a square cap's diagonal, or a mitre's limit. a negative radius
-// erodes the geo, which stays within its bbox.
-fn buffer_category(literals: &[&ScalarValue]) -> Result<Category> {
-    let ScalarValue::Float64(Some(radius)) = literals[0].cast_to(&DataType::Float64)? else {
-        return Ok(Category::Unsupported);
-    };
-    // an integer style is the quad_segs, which doesn't widen the buffer.
-    let style = match literals.get(1) {
-        None => BufferStyle::default(),
-        Some(ScalarValue::Utf8(Some(text))) => BufferStyle::parse(text)?,
-        Some(style) if style.data_type().is_integer() && !style.is_null() => BufferStyle::default(),
-        Some(_) => return Ok(Category::Unsupported),
-    };
-    let cap = match style.endcap {
-        EndCap::Square => std::f64::consts::SQRT_2,
-        _ => 1.0,
-    };
-    let join = match style.join {
-        Join::Mitre { limit } => limit.max(1.0),
-        _ => 1.0,
-    };
-    Ok(Category::Inflate(radius.max(0.0) * cap.max(join)))
+        Ok(false)
+    }
 }
 
 // The bounds of a node over the values of `batch`: the [min, max] of a numeric
-// node as a 2 row batch, the `RawGeo::bounds_batch` of a geo node.
+// node as a 2 row batch, the `bbox_of_rect` of a geo node.
 // None if it can't be bounded. the nodes are bounded from the innermost out,
-// each on its children's bounds, except numeric subtrees, which see all the
-// values of their column.
+// each evaluated on its children's bounds, except numeric subtrees, which see
+// all the values of their column.
 fn bounds(node: &Arc<dyn PhysicalExpr>, batch: &RecordBatch) -> Result<Option<RecordBatch>> {
     let schema = batch.schema();
     let field = node.return_field(&schema)?;
-    if GeoType::from_field(field.name(), field.as_ref()).is_err() {
+    if !GeoType::is_geo_field(&field) {
         return if field.data_type().is_numeric() {
             numeric_node_batch(node, batch)
         } else {
@@ -295,13 +222,12 @@ fn bounds(node: &Arc<dyn PhysicalExpr>, batch: &RecordBatch) -> Result<Option<Re
     }
     if node.downcast_ref::<Column>().is_some() {
         let values = node.evaluate(batch)?.into_array(batch.num_rows())?;
-        return geo_bbox_batch(&values, &field);
+        return bbox_of_geos(&values, &field);
     }
-
-    let category = category(node, &schema)?;
-    if matches!(category, Category::Unsupported) {
+    if !is_supported(node, &schema)? {
         return Ok(None);
     }
+
     let mut child_bounds = Vec::new();
     for child in node.children() {
         if child.downcast_ref::<Literal>().is_some() {
@@ -313,12 +239,10 @@ fn bounds(node: &Arc<dyn PhysicalExpr>, batch: &RecordBatch) -> Result<Option<Re
         };
         child_bounds.push(Some(bounds));
     }
-
-    match category {
-        Category::Separable => separable_node_batch(node, child_bounds),
-        Category::Inflate(buffer) => inflate_node_batch(&field, child_bounds, buffer),
-        Category::Unsupported => Ok(None),
-    }
+    let (node, batch) = rebind_children(node, child_bounds)?;
+    let field = node.return_field(&batch.schema())?;
+    let values = node.evaluate(&batch)?.into_array(batch.num_rows())?;
+    bbox_of_geos(&values, &field)
 }
 
 // Identity is defined by the probe expression alone; the build-side future is
@@ -367,20 +291,20 @@ impl PhysicalExpr for ProbePruningExpr {
     // the readers. the buffer (Some for ST_DWithin) inflates the chunk's bbox so
     // it keeps the chunks within the distance of a build geometry.
     fn evaluate(&self, batch: &RecordBatch) -> Result<ColumnarValue> {
-        let bbox = bounds(&self.probe_expr, batch).and_then(|corners| {
-            let Some(corners) = corners else {
-                return Ok(None);
-            };
-            RawGeo::try_new(corners.schema().field(0), Arc::clone(corners.column(0)))?
-                .with_buffer(self.probe_side_buffer)
-                .overall_bbox()
-        });
+        let bbox = match bounds(&self.probe_expr, batch)? {
+            Some(corners) => {
+                RawGeo::try_new(corners.schema().field(0), Arc::clone(corners.column(0)))?
+                    .with_bbox_margin(self.probe_side_buffer)
+                    .overall_bbox()?
+            }
+            None => None,
+        };
         let keep = match bbox {
-            Ok(Some(bbox)) => {
+            Some(bbox) => {
                 let (matches, _) = self.index.traverse(vec![bbox], vec![0]);
                 !matches.is_empty()
             }
-            _ => true,
+            None => true,
         };
         Ok(ColumnarValue::Scalar(ScalarValue::Boolean(Some(keep))))
     }
@@ -410,6 +334,7 @@ mod pruning_tests {
     use arrow_array::BinaryArray;
     use arrow_schema::Field;
     use datafusion::common::DFSchema;
+    use serde_json::Value;
 
     use super::*;
     use crate::geospatial::geos::indexed_build_side::test_helpers::make_typed_indexed_build_side;
@@ -494,9 +419,9 @@ mod pruning_tests {
         truth_and_keep(sql, left_wkt, left_type, &batch, &batch)
     }
 
-    // The probe side is a single polygon of type `right_type`, pruned from its
+    // The probe side is a single geo of type `right_type`, pruned from its
     // bbox, as the geoparquet reader does with its statistics.
-    fn polygon_truth_and_keep(
+    fn geo_truth_and_keep(
         sql: &str,
         left_wkt: &str,
         left_type: &GeoType,
@@ -513,10 +438,7 @@ mod pruning_tests {
             .overall_bbox_f64()
             .unwrap()
             .unwrap();
-        let (min, max) = (bbox.min(), bbox.max());
-        let bounds = RawGeo::bounds_batch(field.as_ref(), min.x, min.y, max.x, max.y)
-            .unwrap()
-            .unwrap();
+        let bounds = bbox_of_rect(&field, &bbox).unwrap().unwrap();
         truth_and_keep(sql, left_wkt, left_type, &batch, &bounds)
     }
 
@@ -550,7 +472,7 @@ mod pruning_tests {
     // and the bottom one at ~67.2, so the polygon covers (0 70).
     #[test]
     fn polygon_relabel_keeps_bulge() {
-        let (truth, keep) = polygon_truth_and_keep(
+        let (truth, keep) = geo_truth_and_keep(
             "st_togeography(geom)",
             "POLYGON((-1 69.5, 1 69.5, 1 70.5, -1 70.5, -1 69.5))",
             &geography(),
@@ -563,12 +485,127 @@ mod pruning_tests {
 
     #[test]
     fn polygon_geography_buffer_prunes_far() {
-        let (truth, keep) = polygon_truth_and_keep(
+        let (truth, keep) = geo_truth_and_keep(
             "st_buffer(st_togeography(geom), 100000.0)",
             "POLYGON((149 -41, 151 -41, 151 -39, 149 -39, 149 -41))",
             &geography(),
             "POLYGON((-60 50, 60 50, 60 60, -60 60, -60 50))",
             &geometry_4326(),
+        );
+        assert!(!truth, "the case shouldn't intersect");
+        assert!(!keep, "a far chunk was kept");
+    }
+
+    const GEOMETRY_LINE: &str = "LINESTRING(-10 0, 10 0)";
+    const GEOMETRY_POLYGON: &str = "POLYGON((-10 -10, 10 -10, 10 10, -10 10, -10 -10))";
+    const NEAR_ORIGIN: &str = "POLYGON((-1 -1, 1 -1, 1 1, -1 1, -1 -1))";
+    const FAR_FROM_ORIGIN: &str = "POLYGON((49 49, 51 49, 51 51, 49 51, 49 49))";
+
+    // the line peaks at ~73.9 as a geography, past its vertices' latitude.
+    const GEOGRAPHY_LINE: &str = "LINESTRING(-60 60, 60 60)";
+    // the top edge peaks at ~73.9 as a geography, and the bottom one at ~67.2.
+    const GEOGRAPHY_POLYGON: &str = "POLYGON((-60 50, 60 50, 60 60, -60 60, -60 50))";
+    const FAR_FROM_BAND: &str = "POLYGON((149 -41, 151 -41, 151 -39, 149 -39, 149 -41))";
+
+    #[test]
+    fn geometry_line_keeps_near() {
+        let (truth, keep) = geo_truth_and_keep(
+            "geom",
+            NEAR_ORIGIN,
+            &geometry_4326(),
+            GEOMETRY_LINE,
+            &geometry_4326(),
+        );
+        assert!(truth, "the case should intersect");
+        assert!(keep, "an intersecting chunk was pruned");
+    }
+
+    #[test]
+    fn geometry_line_prunes_far() {
+        let (truth, keep) = geo_truth_and_keep(
+            "geom",
+            FAR_FROM_ORIGIN,
+            &geometry_4326(),
+            GEOMETRY_LINE,
+            &geometry_4326(),
+        );
+        assert!(!truth, "the case shouldn't intersect");
+        assert!(!keep, "a far chunk was kept");
+    }
+
+    #[test]
+    fn geometry_polygon_keeps_near() {
+        let (truth, keep) = geo_truth_and_keep(
+            "geom",
+            NEAR_ORIGIN,
+            &geometry_4326(),
+            GEOMETRY_POLYGON,
+            &geometry_4326(),
+        );
+        assert!(truth, "the case should intersect");
+        assert!(keep, "an intersecting chunk was pruned");
+    }
+
+    #[test]
+    fn geometry_polygon_prunes_far() {
+        let (truth, keep) = geo_truth_and_keep(
+            "geom",
+            FAR_FROM_ORIGIN,
+            &geometry_4326(),
+            GEOMETRY_POLYGON,
+            &geometry_4326(),
+        );
+        assert!(!truth, "the case shouldn't intersect");
+        assert!(!keep, "a far chunk was kept");
+    }
+
+    #[test]
+    fn geography_line_keeps_bulge() {
+        let (truth, keep) = geo_truth_and_keep(
+            "geom",
+            "POLYGON((-1 73.5, 1 73.5, 1 74.5, -1 74.5, -1 73.5))",
+            &geography(),
+            GEOGRAPHY_LINE,
+            &geography(),
+        );
+        assert!(truth, "the case should intersect");
+        assert!(keep, "an intersecting chunk was pruned");
+    }
+
+    #[test]
+    fn geography_line_prunes_far() {
+        let (truth, keep) = geo_truth_and_keep(
+            "geom",
+            FAR_FROM_BAND,
+            &geography(),
+            GEOGRAPHY_LINE,
+            &geography(),
+        );
+        assert!(!truth, "the case shouldn't intersect");
+        assert!(!keep, "a far chunk was kept");
+    }
+
+    #[test]
+    fn geography_polygon_keeps_bulge() {
+        let (truth, keep) = geo_truth_and_keep(
+            "geom",
+            "POLYGON((-1 69.5, 1 69.5, 1 70.5, -1 70.5, -1 69.5))",
+            &geography(),
+            GEOGRAPHY_POLYGON,
+            &geography(),
+        );
+        assert!(truth, "the case should intersect");
+        assert!(keep, "an intersecting chunk was pruned");
+    }
+
+    #[test]
+    fn geography_polygon_prunes_far() {
+        let (truth, keep) = geo_truth_and_keep(
+            "geom",
+            FAR_FROM_BAND,
+            &geography(),
+            GEOGRAPHY_POLYGON,
+            &geography(),
         );
         assert!(!truth, "the case shouldn't intersect");
         assert!(!keep, "a far chunk was kept");

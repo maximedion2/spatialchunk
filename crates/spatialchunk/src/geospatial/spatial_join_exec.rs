@@ -40,6 +40,7 @@ use crate::geospatial::geos::{build_from_streams, BBoxedGeoStream, IndexedBuildS
 use crate::geospatial::join_predicates::{RelationPredicate, SpatialRelationType};
 use crate::geospatial::probe_pruning_expr::ProbePruningExpr;
 use crate::geospatial::spatial_join_stream::{SharedIndexFuture, SpatialJoinStream};
+use crate::zarr_store_opener::zarr_store_interface::SpatialPruningExpr;
 
 #[derive(Debug, Clone)]
 pub struct SpatialJoinExec {
@@ -447,11 +448,14 @@ impl ExecutionPlan for SpatialJoinExec {
                         // Now that the index exists, fill in the pushed-down
                         // dynamic filter so the probe scan can prune chunks.
                         if let Some(dynamic_filter) = &dynamic_filter {
+                            // the probe pruning bounds each column's values, it
+                            // doesn't pair them, so no broadcast.
                             let pruning: Arc<dyn PhysicalExpr> = Arc::new(ProbePruningExpr::new(
                                 Arc::clone(&probe_geo_expr),
                                 Arc::clone(&build_side),
                                 probe_side_buffer,
                             ));
+                            let pruning = Arc::new(SpatialPruningExpr::new(pruning, false));
                             dynamic_filter.update(pruning).map_err(Arc::new)?;
                             dynamic_filter.mark_complete();
                         }
@@ -505,7 +509,7 @@ mod exec_tests {
     use super::SpatialJoinExec;
     use crate::geospatial::join_predicates::{RelationPredicate, SpatialRelationType};
     use crate::geospatial::test_utils::{col1_gte_col2_filter, wkt_to_wkb};
-    use crate::geospatial::udfs::udf_helpers::{geometry_field, GeoMetadata};
+    use crate::geospatial::common::wkb::{geometry_field, GeoMetadata};
 
     // Build side: 8 unit squares, col_1 = row index.
     //   build[1] = (1,1)-(2,2)     → within probe[0]

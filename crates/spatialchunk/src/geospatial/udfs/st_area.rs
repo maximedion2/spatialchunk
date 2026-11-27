@@ -192,7 +192,7 @@ mod geography_area_tests {
     use s2::point::{point_area, Point};
 
     use super::test_helpers::{area, geography};
-    use crate::geospatial::geos::raw_geo::EARTH_RADIUS_METERS;
+    use crate::geospatial::common::constants::EARTH_RADIUS_METERS;
 
     fn s2_point(lon: f64, lat: f64) -> Point {
         Point::from(LatLng::from_degrees(lat, lon))

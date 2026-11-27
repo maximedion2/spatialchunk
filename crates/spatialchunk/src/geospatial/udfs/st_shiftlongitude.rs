@@ -21,7 +21,8 @@ use datafusion::logical_expr::{
     Volatility,
 };
 
-use crate::geospatial::geos::raw_geo::{shift_longitude, GeoType, RawGeo};
+use crate::geospatial::common::crs::shift_longitude;
+use crate::geospatial::geos::raw_geo::{GeoType, RawGeo};
 
 /// `st_shiftlongitude(geom)` wraps a geometry's longitudes to -180..180.
 #[derive(Debug, PartialEq, Eq, Hash)]

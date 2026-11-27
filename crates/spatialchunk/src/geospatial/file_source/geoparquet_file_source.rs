@@ -30,7 +30,7 @@ use datafusion::parquet::file::metadata::{ParquetMetaData, RowGroupMetaData};
 use datafusion::parquet::file::statistics::Statistics as ParquetStatistics;
 use datafusion::physical_expr::expressions::{Column, DynamicFilterPhysicalExpr, Literal};
 use datafusion::physical_expr::projection::ProjectionExprs;
-use datafusion::physical_expr::utils::{reassign_expr_columns, split_conjunction};
+use datafusion::physical_expr::utils::{collect_columns, reassign_expr_columns, split_conjunction};
 use datafusion::physical_expr::{
     EquivalenceProperties, LexOrdering, LexRequirement, PhysicalSortExpr, ScalarFunctionExpr,
 };
@@ -58,12 +58,13 @@ use serde_json::Value;
 
 use crate::geospatial::geos::raw_geo::RawGeo;
 use crate::geospatial::join_predicates::SpatialRelationType;
-use crate::geospatial::probe_pruning_expr::ProbePruningExpr;
+use crate::zarr_store_opener::zarr_store_interface::SpatialPruningExpr;
 use crate::geospatial::spatial_join_optimizer::literal_f64;
-use crate::geospatial::udfs::udf_helpers::{
-    GeoMetadata, ARROW_EXTENSION_METADATA_KEY, ARROW_EXTENSION_NAME_KEY, DEFAULT_GEOPARQUET_CRS,
+use crate::geospatial::common::constants::{
+    ARROW_EXTENSION_METADATA_KEY, ARROW_EXTENSION_NAME_KEY, DEFAULT_GEOPARQUET_CRS,
     GEOARROW_WKB_EXTENSION_NAME,
 };
+use crate::geospatial::common::wkb::GeoMetadata;
 
 // ------------------------------------------------------------------------
 // Plans a single geoparquet file. This is one extra step in front of the
@@ -139,9 +140,9 @@ impl GeoParquetMorselPlanner {
             let Some(inner) = filter.snapshot()? else {
                 continue;
             };
-            let Some(probe) = inner.downcast_ref::<ProbePruningExpr>() else {
+            if inner.downcast_ref::<SpatialPruningExpr>().is_none() {
                 continue;
-            };
+            }
             if pruning.is_some() {
                 return Err(DataFusionError::Internal(
                     "more than one pruning expression pushed to the geoparquet scan".into(),
@@ -149,7 +150,10 @@ impl GeoParquetMorselPlanner {
             }
             // the footer only has the bboxes of geo columns, so the probe
             // expression can only be bounded if it reads a single one.
-            let mut columns = probe.columns();
+            let mut columns: Vec<String> = collect_columns(&inner)
+                .into_iter()
+                .map(|column| column.name().to_string())
+                .collect();
             pruning = match (columns.pop(), columns.is_empty()) {
                 (Some(column), true) => Some(DynamicPruning {
                     column,
@@ -167,15 +171,15 @@ impl GeoParquetMorselPlanner {
         &self,
         metadata: &ParquetMetaData,
         pruning: Option<&DynamicPruning>,
-    ) -> ParquetAccessPlan {
+    ) -> Result<ParquetAccessPlan> {
         let num_row_groups = metadata.num_row_groups();
-        if self.file_is_pruned(metadata, pruning) {
-            return ParquetAccessPlan::new_none(num_row_groups);
+        if self.file_is_pruned(metadata, pruning)? {
+            return Ok(ParquetAccessPlan::new_none(num_row_groups));
         }
 
         let mut access_plan = ParquetAccessPlan::new_all(num_row_groups);
-        self.prune_row_groups(metadata, pruning, &mut access_plan);
-        access_plan
+        self.prune_row_groups(metadata, pruning, &mut access_plan)?;
+        Ok(access_plan)
     }
 
     // the geometry columns that have filters on them, static or dynamic.
@@ -191,47 +195,49 @@ impl GeoParquetMorselPlanner {
 
     // whether a bbox of a geometry column, for the file or a row group, can
     // contain rows that match the filters on that column. the bbox goes through
-    // the geo logic as its 2 corners, anything that fails keeps the rows.
+    // the geo logic, a bbox that isn't valid keeps the rows.
     fn bbox_may_match(
         &self,
         column: &str,
         [xmin, ymin, xmax, ymax]: [f64; 4],
         pruning: Option<&DynamicPruning>,
-    ) -> bool {
-        let Ok(field) = self.schema.field_with_name(column) else {
-            return true;
-        };
-        let Ok(Some(corners)) = RawGeo::bounds_batch(field, xmin, ymin, xmax, ymax) else {
-            return true;
+    ) -> Result<bool> {
+        let field = self.schema.field_with_name(column)?;
+        let Some(bounds) = RawGeo::from_bbox(field, xmin, ymin, xmax, ymax)? else {
+            return Ok(true);
         };
 
         if let Some(Some(rect)) = self.static_bboxes.get(column) {
-            let bbox = RawGeo::try_new(corners.schema().field(0), Arc::clone(corners.column(0)))
-                .and_then(|geo| geo.overall_bbox_f64());
-            if matches!(bbox, Ok(Some(bbox)) if !rects_intersect(&bbox, rect)) {
-                return false;
+            if matches!(bounds.overall_bbox_f64()?, Some(bbox) if !rects_intersect(&bbox, rect)) {
+                return Ok(false);
             }
         }
         if let Some(pruning) = pruning.filter(|pruning| pruning.column == column) {
-            if matches!(corners_kept(&pruning.expr, &corners), Ok(false)) {
-                return false;
+            let bounds = bounds.into_record_batch(column)?;
+            if !bounds_kept(&pruning.expr, &bounds)? {
+                return Ok(false);
             }
         }
-        true
+        Ok(true)
     }
 
     // whether the whole file can be skipped, either because the static filters
     // can't match at all, or because a file bbox (from the geo metadata) is
     // ruled out by the filters.
-    fn file_is_pruned(&self, metadata: &ParquetMetaData, pruning: Option<&DynamicPruning>) -> bool {
+    fn file_is_pruned(
+        &self,
+        metadata: &ParquetMetaData,
+        pruning: Option<&DynamicPruning>,
+    ) -> Result<bool> {
         if self.static_bboxes.values().any(Option::is_none) {
-            return true;
+            return Ok(true);
         }
 
-        self.filtered_columns(pruning).into_iter().any(|column| {
-            file_bbox(metadata, column)
-                .is_some_and(|bbox| !self.bbox_may_match(column, bbox, pruning))
-        })
+        let bboxes = self
+            .filtered_columns(pruning)
+            .into_iter()
+            .map(|column| (column, file_bbox(metadata, column)));
+        self.any_ruled_out(bboxes, pruning)
     }
 
     // skips the row groups whose bbox is ruled out by the filters. a row group
@@ -241,7 +247,7 @@ impl GeoParquetMorselPlanner {
         metadata: &ParquetMetaData,
         pruning: Option<&DynamicPruning>,
         access_plan: &mut ParquetAccessPlan,
-    ) {
+    ) -> Result<()> {
         // where to read the bboxes from is the same for all row groups.
         let columns: Vec<(&str, Vec<RowGroupBBoxSource>)> = self
             .filtered_columns(pruning)
@@ -250,27 +256,44 @@ impl GeoParquetMorselPlanner {
             .filter(|(_, sources)| !sources.is_empty())
             .collect();
         if columns.is_empty() {
-            return;
+            return Ok(());
         }
 
         for (idx, row_group) in metadata.row_groups().iter().enumerate() {
-            let pruned = columns.iter().any(|(column, sources)| {
-                row_group_bbox(row_group, sources)
-                    .is_some_and(|bbox| !self.bbox_may_match(column, bbox, pruning))
-            });
-            if pruned {
+            let bboxes = columns
+                .iter()
+                .map(|(column, sources)| (*column, row_group_bbox(row_group, sources)));
+            if self.any_ruled_out(bboxes, pruning)? {
                 access_plan.skip(idx);
             }
         }
+        Ok(())
+    }
+
+    // whether any of the columns' bboxes is ruled out by the filters. a column
+    // without a bbox can't rule anything out.
+    fn any_ruled_out<'a>(
+        &self,
+        bboxes: impl IntoIterator<Item = (&'a str, Option<[f64; 4]>)>,
+        pruning: Option<&DynamicPruning>,
+    ) -> Result<bool> {
+        for (column, bbox) in bboxes {
+            if let Some(bbox) = bbox {
+                if !self.bbox_may_match(column, bbox, pruning)? {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 }
 
-// Evaluates the pruning expression on the corners of a bbox, its probe column
-// reassigned to the corners' single column.
-fn corners_kept(expr: &Arc<dyn PhysicalExpr>, corners: &RecordBatch) -> Result<bool> {
-    let expr = reassign_expr_columns(Arc::clone(expr), &corners.schema())?;
+// Evaluates the pruning expression on the bounds of a bbox, its probe column
+// reassigned to the bounds' single column.
+fn bounds_kept(expr: &Arc<dyn PhysicalExpr>, bounds: &RecordBatch) -> Result<bool> {
+    let expr = reassign_expr_columns(Arc::clone(expr), &bounds.schema())?;
     Ok(!matches!(
-        expr.evaluate(corners)?,
+        expr.evaluate(bounds)?,
         ColumnarValue::Scalar(ScalarValue::Boolean(Some(false)))
     ))
 }
@@ -295,7 +318,7 @@ impl MorselPlanner for GeoParquetMorselPlanner {
                     .await?;
 
             let pruning = self.resolve_pruning()?;
-            let access_plan = self.build_access_plan(&metadata, pruning.as_ref());
+            let access_plan = self.build_access_plan(&metadata, pruning.as_ref())?;
             let file = self.file.with_extension(access_plan);
             self.inner.plan_file(file)
         })))
@@ -905,7 +928,7 @@ fn spatial_filter_bbox(
     let field = schema.field_with_name(column.name()).ok()?;
     let rect = RawGeo::from_wkb_value(field, bytes)
         .ok()?
-        .with_buffer(buffer)
+        .with_bbox_margin(buffer)
         .overall_bbox_f64()
         .ok()??;
     Some((column.name().to_string(), rect))
@@ -1245,6 +1268,7 @@ mod geoparquet_tests {
 
     use super::*;
     use crate::geospatial::geos::indexed_build_side::test_helpers::make_indexed_build_side;
+    use crate::geospatial::probe_pruning_expr::ProbePruningExpr;
     use crate::geospatial::test_utils::{
         wkt_to_wkb, write_geoparquet_covering, write_geoparquet_geoarrow_encoding,
         write_geoparquet_parquet_geo_type, GEOPARQUET_FILE_NAMES,
@@ -1285,8 +1309,10 @@ mod geoparquet_tests {
         let build_side = [shifted_square_wkt(first), shifted_square_wkt(first + 1)];
         let build_side: Vec<&str> = build_side.iter().map(String::as_str).collect();
         let index = make_indexed_build_side(&build_side, 1, 1, false, "geometry", "val");
-        let pruning: Arc<dyn PhysicalExpr> =
-            Arc::new(ProbePruningExpr::new(geometry_column(), index, None));
+        let pruning: Arc<dyn PhysicalExpr> = Arc::new(SpatialPruningExpr::new(
+            Arc::new(ProbePruningExpr::new(geometry_column(), index, None)),
+            false,
+        ));
 
         (static_filter, pruning)
     }

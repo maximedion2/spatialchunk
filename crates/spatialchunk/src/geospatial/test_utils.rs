@@ -43,9 +43,8 @@ use wkb::writer::{
 };
 use wkt::TryFromWkt;
 
-use crate::geospatial::udfs::udf_helpers::{
-    geometry_field, GeoMetadata, ARROW_EXTENSION_NAME_KEY, GEOARROW_WKB_EXTENSION_NAME,
-};
+use crate::geospatial::common::constants::{ARROW_EXTENSION_NAME_KEY, GEOARROW_WKB_EXTENSION_NAME};
+use crate::geospatial::common::wkb::{geometry_field, GeoMetadata};
 
 pub(crate) fn wkt_to_wkb(wkt_str: &str) -> Vec<u8> {
     let geom = Geometry::<f64>::try_from_wkt_str(wkt_str).unwrap();

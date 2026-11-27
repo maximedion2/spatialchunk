@@ -56,7 +56,7 @@ pub(crate) fn bboxed_geo_batch(
     let field = geo_expr.return_field(&batch.schema())?;
     let wkb = geo_expr.evaluate(&batch)?.into_array(batch.num_rows())?;
     let (geo_array, rects, geo_ids) = RawGeo::try_new(&field, wkb)?
-        .with_buffer(buffer)
+        .with_bbox_margin(buffer)
         .into_bboxes()?;
     Ok(BBoxedGeoBatch {
         batch,
@@ -113,8 +113,8 @@ mod bbox_geo_batch_tests {
     use geo_types::{Coord, Rect};
 
     use super::*;
+    use crate::geospatial::common::wkb::{geometry_field, GeoMetadata};
     use crate::geospatial::test_utils::wkt_to_wkb;
-    use crate::geospatial::udfs::udf_helpers::{geometry_field, GeoMetadata};
 
     #[test]
     fn test_boxed_geo_batch_squares() {

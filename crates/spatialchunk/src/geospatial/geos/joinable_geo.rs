@@ -21,52 +21,16 @@ use s2::r3::vector::Vector;
 use s2::rect_bounder::RectBounder;
 use wkb::reader::Wkb;
 
-use super::raw_geo::EARTH_RADIUS_METERS;
+use crate::geospatial::common::constants::{GeoError, EARTH_RADIUS_METERS};
+use crate::geospatial::common::crs::wrap_lon_diff;
 
 pub(crate) const EPS: f64 = 1e-10;
 
 // Latitude of the north pole (negated for the south pole), in degrees.
 const POLE_LAT: f64 = 90.0;
 
-// Cheap geometry-validity errors caught at construction (not full
-// DE-9IM validation, just the checks that prevent later misbehavior
-// like divide-by-zero).
-#[derive(Debug)]
-pub(crate) enum GeoError {
-    // The WKB bytes could not be parsed.
-    MalformedWkb(String),
-    // A segment/edge with identical endpoints (zero length).
-    DegenerateSegment,
-    // A spherical segment/edge with (near) antipodal endpoints, for which the
-    // great circle is undefined.
-    AntipodalSegment,
-    // A polygon ring whose first and last vertices differ (or that
-    // produced no edges).
-    UnclosedRing,
-    // A spatial join was given JoinSide::None, which has no valid operand ordering.
-    InvalidJoinSide,
-}
-
-impl std::fmt::Display for GeoError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            GeoError::MalformedWkb(msg) => write!(f, "malformed WKB: {msg}"),
-            GeoError::DegenerateSegment => write!(f, "degenerate segment (identical endpoints)"),
-            GeoError::AntipodalSegment => {
-                write!(f, "antipodal segment (great circle is undefined)")
-            }
-            GeoError::UnclosedRing => write!(f, "polygon ring is not closed"),
-            GeoError::InvalidJoinSide => {
-                write!(f, "JoinSide::None is not valid for a spatial join")
-            }
-        }
-    }
-}
-
-impl std::error::Error for GeoError {}
-
 //*************************************************
-// A simple bbox that well be inserted in a natural spatial index.
+// A simple bbox that will be stored in the natural spatial index.
 //*************************************************
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct IndexBox {
@@ -286,20 +250,24 @@ pub(crate) trait GeoKernel {
     fn poly_bbox(edges: &[Self::Edge], edges_box: IndexBox, ref_status: &RefStatus) -> IndexBox;
 }
 
-// Which poly of a poly geometry the reference point is in, if any. For valid
-// geometries (holes inside their shell, polys with disjoint interiors), a point is
-// in a poly iff an odd number of its rings enclose it, so this is an XOR over each
-// poly's rings, at most one poly having it true.
+// Which poly of a multipoly geometry the end of a ray is in, if any. Rays end just
+// short of the reference point (the north pole on the sphere, infinity on the
+// plane), which only differs from the reference when a ring goes through it.
 //
-// A ring going through the reference doesn't give it a status. Rays then stop just
-// short of the reference, a point whose status depends on the ray's direction, so
-// those rings are kept to be checked per ray. A poly whose shell goes through it
-// has no other ring enclosing it, and a poly with only holes going through it has
-// a shell enclosing it, so for each poly the rings that don't go through it amount
-// to whether it's ref_poly.
+// For valid geometries (holes inside their shell, polys with disjoint
+// interiors), a point is in a poly if an odd number of that poly's rings
+// enclose it, so at most one poly contains it.
+//
+// A ring going through the reference is the exception: which side of it the ray
+// end is on depends on the ray's direction, so it's checked per ray. The other
+// rings still single out at most one poly, `ref_poly`: a poly whose shell goes
+// through the reference has no other ring enclosing it, and a poly whose holes
+// go through it has its shell enclosing it.
 pub(crate) struct RefStatus {
-    // The poly whose rings that don't go through the reference enclose it.
+    // The poly an odd number of whose rings, among those that don't go through
+    // the reference, enclose it.
     ref_poly: Option<usize>,
+    // The rings that go through the reference, checked per ray.
     pole_rings: Vec<Ring>,
 
     // Spherical only. Whether the south pole's status differs from the north
@@ -541,7 +509,7 @@ fn x_intercept(p1: &PlanarPoint, p2: &PlanarPoint, p: &PlanarPoint) -> Option<f6
 }
 
 //*************************************************
-// Planar implementation of the GeoKernal.
+// Planar implementation of the GeoKernel.
 //*************************************************
 pub(crate) struct Planar;
 
@@ -872,17 +840,6 @@ impl Edge for SphericalEdge {
     }
 }
 
-// Wraps a longitude difference into (-180, 180].
-pub(crate) fn wrap_lon_diff(d: f64) -> f64 {
-    if d > 180.0 {
-        d - 360.0
-    } else if d <= -180.0 {
-        d + 360.0
-    } else {
-        d
-    }
-}
-
 // The latitude where the edge reaches longitude p.x, or None when p.x is
 // outside the edge's longitude span or the edge lies along a meridian (same
 // longitude at both ends, a pole endpoint, or passing over a pole). An edge
@@ -976,8 +933,8 @@ impl Ring {
     }
 
     // An edge starting at the pole isn't counted, the previous one is. An edge
-    // goes over a pole when its endpoints are 180 degrees of longitude apart, the
-    // nearer pole.
+    // goes over a pole when its endpoints are 180 degrees of longitude apart, over
+    // the nearer pole.
     fn goes_through_north_pole(edge: &SphericalEdge) -> bool {
         let (p1, p2) = (edge.p1(), edge.p2());
         if p2.y == POLE_LAT {
@@ -1043,7 +1000,7 @@ impl Ring {
 }
 
 //*************************************************
-// Spherical implementation of the GeoKernal.
+// Spherical implementation of the GeoKernel.
 //*************************************************
 pub(crate) struct Spherical;
 
@@ -1414,10 +1371,10 @@ pub(crate) fn midpoint_ray_check<K: GeoKernel, S: Segment<P = K::Point>>(
 // Classifies the intersection of one left segment with one poly edge (edge, whose
 // interior wedge is formed with next). Returns (qualifying, signed_t):
 // - qualifying, the segment touches the polygon interior here.
-// - signed_t, a recorded crossing the crossing's parameter on the left segment, "+"
-//   for entering, "−" for exiting. None when nothing is recorded.
+// - signed_t, the parameter on the left segment of a recorded crossing, "+" for
+//   entering, "−" for exiting. None when nothing is recorded.
 // Collinear crossings can be triggered by either the edge or the next edge being
-// collinear with the segment. Both need to be checked to detect entring the edge
+// collinear with the segment. Both need to be checked to detect entering the edge
 // and leaving the edge.
 pub(crate) fn segment_crossing_check<K: GeoKernel, S: Segment<P = K::Point>>(
     left: &S,
@@ -1445,9 +1402,9 @@ pub(crate) fn segment_crossing_check<K: GeoKernel, S: Segment<P = K::Point>>(
         }
         // Convex peel into the exterior: record a signed crossing (not an interior
         // contact). Check if edge or next is the edge that's collinear with the
-        // segment (either would lead to this), which tells you if you're crossing
-        // the first endpoint or the second endpoint, then combine with the
-        // directions, and you can tell if you entering or exiting.
+        // segment (either would lead to this), which tells whether it's the first
+        // or the second endpoint being crossed, and with the directions, whether
+        // the segment is entering or exiting.
         let exit = if collinear_edge {
             K::same_direction(left, edge)
         } else {
@@ -1480,7 +1437,7 @@ pub(crate) fn segment_crossing_check<K: GeoKernel, S: Segment<P = K::Point>>(
 }
 
 // How one left polygon edge relates to one right polygon edge (edge, interior wedge
-// formed with next), Like segment_crossing_check but for an Edge left side and with
+// formed with next). Like segment_crossing_check but for an Edge left side and with
 // no signed-t bookkeeping (a single container, nothing to cancel). Returns (disqualifies,
 // collinear_inside):
 // - disqualifies: a transversal/owned-vertex crossing, or a collinear overlap with the
@@ -1926,7 +1883,7 @@ fn dual_recurse<AC: Bboxable, BC: Bboxable, A: Accumulator>(
 }
 
 //*************************************************
-// A represenation of a geometry as its components
+// A representation of a geometry as its components
 //*************************************************
 pub(crate) enum JoinableGeo<K: GeoKernel> {
     Point {
@@ -2190,7 +2147,7 @@ fn build_line_geo<K: GeoKernel, LS: LineStringTrait<T = f64>>(
     let index = NaturalIndex::from_components(&lines, 0);
 
     // Compute the mod-2 endpoint boundary flags via a cheap, faithful
-    //  self-join over the segment endpoints as points. Each segment contributes
+    // self-join over the segment endpoints as points. Each segment contributes
     // its two endpoints, laid out so endpoint 2*i is segment i's p1 and `2*i + 1`
     // is its p2; the tag is implicit in that layout. A flags entry is true
     // (boundary) unless an odd number of coincident endpoints cancel it.

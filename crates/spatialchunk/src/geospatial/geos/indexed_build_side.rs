@@ -15,10 +15,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 
 use arrow::compute::{interleave, nullif};
-use arrow_array::{
-    new_null_array, Array, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, RecordBatch,
-};
-use arrow_schema::DataType;
+use arrow_array::{new_null_array, Array, ArrayRef, BooleanArray, RecordBatch};
 use datafusion::common::JoinSide;
 use datafusion::error::{DataFusionError, Result};
 use futures::TryStreamExt;
@@ -27,7 +24,9 @@ use geo_index::rtree::{Node, RTree as GeoRTree, RTreeBuilder, RTreeIndex};
 use geo_types::Rect;
 
 use super::boxed_geo_batch::{BBoxedGeoBatch, BBoxedGeoStream};
-use super::joinable_geo::{GeoError, GeoKernel, JoinableGeo, Planar, Spherical};
+use super::joinable_geo::{GeoKernel, JoinableGeo, Planar, Spherical};
+use crate::geospatial::common::constants::GeoError;
+use crate::geospatial::common::wkb::wkb_at;
 use crate::geospatial::join_predicates::st_coveredby::{st_covered_by, st_covers};
 use crate::geospatial::join_predicates::st_dwithin::st_dwithin;
 use crate::geospatial::join_predicates::st_intersects::st_intersects;
@@ -103,20 +102,9 @@ fn descend<T: RTreeIndex<f32>>(
     }
 }
 
-fn wkb_at(array: &ArrayRef, row_idx: usize) -> &[u8] {
-    match array.data_type() {
-        DataType::Binary => array
-            .as_any()
-            .downcast_ref::<BinaryArray>()
-            .expect("geometry array is Binary")
-            .value(row_idx),
-        DataType::BinaryView => array
-            .as_any()
-            .downcast_ref::<BinaryViewArray>()
-            .expect("geometry array is BinaryView")
-            .value(row_idx),
-        other => panic!("unsupported geometry array type: {other}"),
-    }
+// The wkb of an indexed geo, null geos aren't indexed.
+fn indexed_wkb(array: &ArrayRef, row_idx: usize) -> Result<&[u8], GeoError> {
+    wkb_at(array, row_idx).ok_or_else(|| GeoError::MalformedWkb("null geometry".into()))
 }
 
 // Lazy, thread-safe cache of parsed build-side JoinableGeo's.
@@ -151,7 +139,7 @@ impl<K: GeoKernel> CachedJoinableGeo<K> {
                     return Ok(unsafe { &*ptr });
                 }
                 let arr = &self.geo_arrays[batch_idx];
-                let bytes: &[u8] = wkb_at(arr, row_idx);
+                let bytes: &[u8] = indexed_wkb(arr, row_idx)?;
                 let new_ptr = Box::into_raw(Box::new(JoinableGeo::from_wkb(bytes)?));
                 match slot.compare_exchange(
                     std::ptr::null_mut(),
@@ -301,7 +289,7 @@ impl IndexedBuildSide {
         let mut probe_geos: HashMap<usize, JoinableGeo<K>> = HashMap::new();
         for &probe_id in &probe_matched {
             if let Entry::Vacant(e) = probe_geos.entry(probe_id) {
-                let geo = JoinableGeo::from_wkb(wkb_at(probe_geo_array, probe_id))?;
+                let geo = JoinableGeo::from_wkb(indexed_wkb(probe_geo_array, probe_id)?)?;
                 e.insert(geo);
             }
         }
@@ -504,7 +492,7 @@ pub(crate) mod test_helpers {
     use crate::geospatial::geos::boxed_geo_batch::{bboxed_geo_batch, BBoxedGeoBatch};
     use crate::geospatial::geos::raw_geo::GeoType;
     use crate::geospatial::test_utils::wkt_to_wkb;
-    use crate::geospatial::udfs::udf_helpers::{geometry_field, GeoMetadata};
+    use crate::geospatial::common::wkb::{geometry_field, GeoMetadata};
 
     pub(crate) fn make_geo_batch(
         wkbs: &[Vec<u8>],

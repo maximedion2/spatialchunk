@@ -25,7 +25,8 @@ use geo_types::Geometry;
 use wkb::writer::{write_geometry, WriteOptions};
 use wkt::TryFromWkt;
 
-use super::udf_helpers::{crs_argument, geometry_field, signature_with_optional_crs, GeoMetadata};
+use super::udf_helpers::{crs_argument, signature_with_optional_crs};
+use crate::geospatial::common::wkb::{geometry_field, GeoMetadata};
 
 /// `st_geomfromwkb(geom [, crs])` stamps an already-WKB binary column as
 /// geometry. The bytes are passed through unchanged; only the output field is
@@ -159,7 +160,7 @@ mod geomfrom_tests {
 
     use super::*;
     use crate::geospatial::test_utils::wkt_to_wkb;
-    use crate::geospatial::udfs::udf_helpers::GEOARROW_WKB_EXTENSION_NAME;
+    use crate::geospatial::common::constants::GEOARROW_WKB_EXTENSION_NAME;
 
     const POLYS: [&str; 2] = [
         "POLYGON ((0 0, 2 0, 2 2, 0 2, 0 0))",

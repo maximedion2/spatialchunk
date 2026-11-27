@@ -11,14 +11,14 @@
 // limitations under the License.
 
 use arrow_schema::{DataType, FieldRef};
-use datafusion::common::Result;
+use datafusion::common::{plan_err, Result};
 use datafusion::logical_expr::{
     ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl, Signature,
 };
 
-use super::udf_helpers::{
-    crs_argument, geometry_field, require_planar_geometry, signature_with_crs, GeoMetadata,
-};
+use super::udf_helpers::{crs_argument, signature_with_crs};
+use crate::geospatial::common::wkb::{geometry_field, GeoMetadata};
+use crate::geospatial::geos::raw_geo::GeoType;
 
 /// `st_setcrs(geom, crs)` sets the crs of a geometry, replacing any existing
 /// one. The coordinates are not transformed, see `st_transform` for that.
@@ -50,7 +50,9 @@ impl ScalarUDFImpl for StSetCrsUdf {
 
     fn return_field_from_args(&self, args: ReturnFieldArgs) -> Result<FieldRef> {
         let input = &args.arg_fields[0];
-        require_planar_geometry(self.name(), input)?;
+        if GeoType::from_field(self.name(), input.as_ref())?.is_geography() {
+            return plan_err!("{}: expected a geometry, got a geography", self.name());
+        }
         let crs = crs_argument(self.name(), &args, 1)?;
         Ok(geometry_field(
             input.name(),

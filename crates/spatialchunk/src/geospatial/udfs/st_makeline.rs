@@ -16,7 +16,7 @@ use datafusion::logical_expr::{
     ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl, Signature,
 };
 
-use super::spatial_predicate_udfs::binary_pair_signature;
+use super::udf_helpers::binary_pair_signature;
 use crate::geospatial::geos::raw_geo::{GeoType, RawGeo};
 
 /// `st_makeline(point, point)` constructs a 2 point line string from two point
@@ -74,7 +74,7 @@ mod udf_tests {
     use wkb::reader::Wkb;
 
     use super::*;
-    use crate::geospatial::udfs::udf_helpers::GeoMetadata;
+    use crate::geospatial::common::wkb::GeoMetadata;
 
     fn crs() -> Option<Value> {
         Some(Value::String("EPSG:4326".into()))
