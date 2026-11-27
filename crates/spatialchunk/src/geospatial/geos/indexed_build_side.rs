@@ -489,10 +489,10 @@ pub(crate) mod test_helpers {
     use datafusion::physical_plan::PhysicalExpr;
 
     use super::{IndexedBuildSide, IndexedBuildSideBuilder};
+    use crate::geospatial::common::wkb::{geometry_field, GeoMetadata};
     use crate::geospatial::geos::boxed_geo_batch::{bboxed_geo_batch, BBoxedGeoBatch};
     use crate::geospatial::geos::raw_geo::GeoType;
     use crate::geospatial::test_utils::wkt_to_wkb;
-    use crate::geospatial::common::wkb::{geometry_field, GeoMetadata};
 
     pub(crate) fn make_geo_batch(
         wkbs: &[Vec<u8>],

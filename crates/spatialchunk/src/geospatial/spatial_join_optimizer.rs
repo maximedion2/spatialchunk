@@ -338,8 +338,8 @@ mod optimizer_tests {
 
     use super::super::udfs::{StDWithinUdf, StWithinUdf};
     use super::*;
-    use crate::geospatial::join_predicates::SpatialRelationType;
     use crate::geospatial::common::wkb::{geometry_field, GeoMetadata};
+    use crate::geospatial::join_predicates::SpatialRelationType;
 
     // The field metadata a real geometry column carries (the `geoarrow.wkb`
     // extension tag), reused to build tagged filter-schema fields.

@@ -77,10 +77,10 @@ mod togeography_tests {
     use serde_json::Value;
 
     use super::*;
-    use crate::geospatial::test_utils::iou;
-    use crate::geospatial::udfs::st_geomfrom::StGeomFromWktUdf;
     use crate::geospatial::common::constants::GEOGRAPHY_CRS;
     use crate::geospatial::common::wkb::GeoMetadata;
+    use crate::geospatial::test_utils::iou;
+    use crate::geospatial::udfs::st_geomfrom::StGeomFromWktUdf;
 
     // a 100km square in EPSG:5070, and its EPSG:4326 (lon/lat) equivalent
     // from pyproj.

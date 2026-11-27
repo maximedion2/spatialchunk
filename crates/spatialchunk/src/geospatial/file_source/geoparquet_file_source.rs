@@ -56,15 +56,15 @@ use geo_types::{coord, Rect};
 use object_store::{ObjectMeta, ObjectStore};
 use serde_json::Value;
 
-use crate::geospatial::geos::raw_geo::RawGeo;
-use crate::geospatial::join_predicates::SpatialRelationType;
-use crate::zarr_store_opener::zarr_store_interface::SpatialPruningExpr;
-use crate::geospatial::spatial_join_optimizer::literal_f64;
 use crate::geospatial::common::constants::{
     ARROW_EXTENSION_METADATA_KEY, ARROW_EXTENSION_NAME_KEY, DEFAULT_GEOPARQUET_CRS,
     GEOARROW_WKB_EXTENSION_NAME,
 };
 use crate::geospatial::common::wkb::GeoMetadata;
+use crate::geospatial::geos::raw_geo::RawGeo;
+use crate::geospatial::join_predicates::SpatialRelationType;
+use crate::geospatial::spatial_join_optimizer::literal_f64;
+use crate::zarr_store_opener::zarr_store_interface::SpatialPruningExpr;
 
 // ------------------------------------------------------------------------
 // Plans a single geoparquet file. This is one extra step in front of the

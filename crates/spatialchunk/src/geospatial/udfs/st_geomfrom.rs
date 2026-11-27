@@ -159,8 +159,8 @@ mod geomfrom_tests {
     use geos::Geom;
 
     use super::*;
-    use crate::geospatial::test_utils::wkt_to_wkb;
     use crate::geospatial::common::constants::GEOARROW_WKB_EXTENSION_NAME;
+    use crate::geospatial::test_utils::wkt_to_wkb;
 
     const POLYS: [&str; 2] = [
         "POLYGON ((0 0, 2 0, 2 2, 0 2, 0 0))",

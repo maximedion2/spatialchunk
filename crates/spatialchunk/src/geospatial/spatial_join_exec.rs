@@ -507,9 +507,9 @@ mod exec_tests {
     use futures::TryStreamExt;
 
     use super::SpatialJoinExec;
+    use crate::geospatial::common::wkb::{geometry_field, GeoMetadata};
     use crate::geospatial::join_predicates::{RelationPredicate, SpatialRelationType};
     use crate::geospatial::test_utils::{col1_gte_col2_filter, wkt_to_wkb};
-    use crate::geospatial::common::wkb::{geometry_field, GeoMetadata};
 
     // Build side: 8 unit squares, col_1 = row index.
     //   build[1] = (1,1)-(2,2)     → within probe[0]

@@ -1694,7 +1694,10 @@ impl PhysicalExpr for SpatialPruningExpr {
         self: Arc<Self>,
         children: Vec<Arc<dyn PhysicalExpr>>,
     ) -> datafusion::error::Result<Arc<dyn PhysicalExpr>> {
-        Ok(Arc::new(Self::new(Arc::clone(&children[0]), self.broadcast)))
+        Ok(Arc::new(Self::new(
+            Arc::clone(&children[0]),
+            self.broadcast,
+        )))
     }
 
     fn fmt_sql(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
